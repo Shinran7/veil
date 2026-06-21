@@ -135,6 +135,22 @@ AI_ENGAGE_HOLD_THRUST = 0.30
 AI_ENGAGE_SNAP_THRUST = 0.18
 AI_SOLO_DOGFIGHT_MAX_DIST = 500.0
 
+# Heavy 1v1: slow hulls need deliberate closes, not endless long-range meanders
+AI_HEAVY_DUEL_COMMIT_AFTER = 1.4
+AI_HEAVY_DUEL_COMMIT_DURATION = 1.5
+AI_HEAVY_DUEL_COMMIT_THRUST = 0.85
+AI_HEAVY_DUEL_CLOSE_THRUST = 0.68
+AI_HEAVY_DUEL_BAND_THRUST = 0.55
+AI_HEAVY_DUEL_CENTER_BIAS = 0.3
+
+# Enemy motion prediction (acceleration + turn continuation for aim/steer)
+AI_PREDICT_ACCEL_BLEND = 0.34
+AI_PREDICT_MAX_ACCEL = 260.0
+AI_PREDICT_TURN_BLEND_MAX = 0.62
+AI_PREDICT_TURN_SENSITIVITY = 0.42
+AI_PREDICT_HEAVY_TURN_MULT = 1.28
+AI_PREDICT_AIM_HORIZON_MAX = 0.38
+
 # Scoring
 SCORE_PER_KILL = 100
 SCORE_PER_SECOND = 2
@@ -143,3 +159,15 @@ SCORE_PER_WAVE = 250
 HIGH_SCORE_FILE = "highscores.json"
 BINDINGS_FILE = "bindings.json"
 SETTINGS_FILE = "settings.json"
+
+# Audio — drop generated MP3s into MUSIC_DIR (e.g. from a separate music project)
+MUSIC_DIR = "assets/music"
+DEFAULT_SFX_VOLUME = 0.8
+DEFAULT_MUSIC_VOLUME = 0.6
+VOLUME_STEP = 0.05
+MUSIC_FADE_OUT_SECONDS = 3.0
+MUSIC_GAP_SECONDS = 1.0
+MUSIC_CHANNEL = 7
+
+# Behind-target gun run: snap nose toward target instead of kiting sideways
+AI_SHOT_ALIGN_BEARING = 0.32

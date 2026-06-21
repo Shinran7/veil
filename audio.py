@@ -1,10 +1,13 @@
-"""Procedural sound effects via pygame.mixer."""
+"""Procedural SFX and MP3 background music via pygame.mixer."""
 
 from __future__ import annotations
 
 import array
 import math
+from pathlib import Path
 from typing import TYPE_CHECKING
+
+import config
 
 if TYPE_CHECKING:
     import pygame
@@ -83,7 +86,7 @@ class SoundManager:
     }
 
     def __init__(self) -> None:
-        self.enabled = True
+        self.sfx_volume = config.DEFAULT_SFX_VOLUME
         self._sounds: dict[str, object] = {}
         self._cooldowns: dict[str, float] = {}
 
@@ -111,7 +114,7 @@ class SoundManager:
             self._cooldowns[name] = max(0.0, self._cooldowns[name] - dt)
 
     def play(self, name: str) -> bool:
-        if not self.enabled:
+        if self.sfx_volume <= 0.0:
             return False
         interval = self._MIN_INTERVAL.get(name, 0.08)
         if self._cooldowns.get(name, 0.0) > 0.0:
@@ -119,6 +122,7 @@ class SoundManager:
         sound = self._sounds.get(name)
         if sound is None:
             return False
+        sound.set_volume(self.sfx_volume)  # type: ignore[union-attr]
         sound.play(0)  # type: ignore[union-attr]  # 0 = play once; -1 loops forever
         self._cooldowns[name] = interval
         return True
@@ -132,3 +136,147 @@ class SoundManager:
                 continue
             if self.play(name):
                 played[name] = played.get(name, 0) + 1
+
+
+def _next_track_index(current: int, track_count: int) -> int:
+    if track_count <= 0:
+        return 0
+    return (current + 1) % track_count
+
+
+def _fade_should_start(elapsed: float, duration: float, fade_seconds: float) -> bool:
+    if duration <= fade_seconds:
+        return elapsed > 0.0
+    return elapsed >= duration - fade_seconds
+
+
+class MusicManager:
+    """Round-robin MP3 playlist with end-of-track fade and a short gap."""
+
+    def __init__(self) -> None:
+        self.music_volume = config.DEFAULT_MUSIC_VOLUME
+        self._tracks: list[Path] = []
+        self._sounds: dict[Path, object] = {}
+        self._durations: dict[Path, float] = {}
+        self._track_index = 0
+        self._channel: object | None = None
+        self._active = False
+        self._paused = False
+        self._phase = "idle"
+        self._elapsed = 0.0
+        self._gap_remaining = 0.0
+        self._fade_triggered = False
+
+    def init(self) -> None:
+        import pygame
+
+        if not pygame.mixer.get_init():
+            pygame.mixer.init(frequency=44100, size=-16, channels=12, buffer=512)
+        self._channel = pygame.mixer.Channel(config.MUSIC_CHANNEL)
+        music_dir = Path(config.MUSIC_DIR)
+        self._tracks = []
+        self._sounds = {}
+        self._durations = {}
+        if not music_dir.is_dir():
+            return
+        for path in sorted(music_dir.glob("*.mp3")):
+            try:
+                sound = pygame.mixer.Sound(str(path))
+            except pygame.error:
+                continue
+            self._tracks.append(path)
+            self._sounds[path] = sound
+            self._durations[path] = sound.get_length()
+
+    def set_volume(self, volume: float) -> None:
+        self.music_volume = max(0.0, min(1.0, volume))
+        if self._channel and self._phase == "playing" and not self._fade_triggered:
+            self._channel.set_volume(self.music_volume)  # type: ignore[union-attr]
+
+    def tick(self, dt: float) -> None:
+        if self._paused or not self._active or not self._tracks or self.music_volume <= 0.0:
+            return
+        if self._phase == "gap":
+            self._gap_remaining -= dt
+            if self._gap_remaining <= 0.0:
+                self._track_index = _next_track_index(self._track_index, len(self._tracks))
+                self._begin_track()
+            return
+        if self._phase != "playing":
+            return
+        self._elapsed += dt
+        track = self._tracks[self._track_index]
+        duration = self._durations[track]
+        if not self._fade_triggered and _fade_should_start(
+            self._elapsed, duration, config.MUSIC_FADE_OUT_SECONDS
+        ):
+            self._fade_triggered = True
+            fade_ms = int(config.MUSIC_FADE_OUT_SECONDS * 1000)
+            if self._channel:
+                self._channel.fadeout(fade_ms)  # type: ignore[union-attr]
+        if self._channel and not self._channel.get_busy():  # type: ignore[union-attr]
+            self._begin_gap()
+
+    def start(self) -> None:
+        if self.music_volume <= 0.0 or not self._tracks:
+            self.stop()
+            return
+        self._active = True
+        self._paused = False
+        if self._phase == "idle":
+            self._begin_track()
+
+    def stop(self) -> None:
+        if self._channel:
+            self._channel.stop()  # type: ignore[union-attr]
+        self._active = False
+        self._paused = False
+        self._phase = "idle"
+        self._elapsed = 0.0
+        self._gap_remaining = 0.0
+        self._fade_triggered = False
+        self._track_index = 0
+
+    def pause(self) -> None:
+        self._paused = True
+        if self._channel:
+            self._channel.pause()  # type: ignore[union-attr]
+
+    def unpause(self) -> None:
+        if self.music_volume <= 0.0:
+            self.stop()
+            return
+        if not self._tracks:
+            return
+        self._active = True
+        self._paused = False
+        if self._phase == "idle":
+            self._begin_track()
+            return
+        if self._channel:
+            self._channel.set_volume(self.music_volume)  # type: ignore[union-attr]
+            if self._channel.get_busy():  # type: ignore[union-attr]
+                self._channel.unpause()  # type: ignore[union-attr]
+            elif self._phase == "playing":
+                self._begin_track()
+
+    def has_tracks(self) -> bool:
+        return bool(self._tracks)
+
+    def _begin_track(self) -> None:
+        if not self._tracks or self._channel is None:
+            self._phase = "idle"
+            return
+        track = self._tracks[self._track_index]
+        sound = self._sounds[track]
+        self._channel.set_volume(self.music_volume)  # type: ignore[union-attr]
+        self._channel.play(sound, loops=0)  # type: ignore[union-attr]
+        self._elapsed = 0.0
+        self._fade_triggered = False
+        self._phase = "playing"
+
+    def _begin_gap(self) -> None:
+        self._phase = "gap"
+        self._gap_remaining = config.MUSIC_GAP_SECONDS
+        self._elapsed = 0.0
+        self._fade_triggered = False

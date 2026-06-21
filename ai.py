@@ -44,6 +44,15 @@ VARIANT_TIER = {
 
 
 @dataclass
+class TargetMotionTrack:
+    last_velocity: Vec2 = (0.0, 0.0)
+    last_angular_velocity: float = 0.0
+    velocity_delta: Vec2 = (0.0, 0.0)
+    angular_accel: float = 0.0
+    initialized: bool = False
+
+
+@dataclass
 class AIDecisionContext:
     """Snapshot of AI reasoning for one tick — used by telemetry."""
 
@@ -58,6 +67,7 @@ class AIDecisionContext:
     shield_ramming: bool = False
     seeking_powerup: bool = False
     breaking_orbit: bool = False
+    heavy_duel: bool = False
     engage_quality: float = 0.0
     rotate: float = 0.0
     thrust: float = 0.0
@@ -80,6 +90,9 @@ class AIController:
         self.panic_burst_timer = 0.0
         self.last_dist = 0.0
         self.locked_target_id: int | None = None
+        self.heavy_duel_stale_timer = 0.0
+        self.heavy_duel_commit_timer = 0.0
+        self._target_tracks: dict[int, TargetMotionTrack] = {}
         self.last_context = AIDecisionContext()
 
     @classmethod
@@ -259,6 +272,7 @@ class AIController:
         ship: Ship,
         aim_pos: Vec2,
         arena_rect: tuple[float, float, float, float] | None,
+        bias_scale: float = 1.0,
     ) -> Vec2:
         if arena_rect is None:
             return aim_pos
@@ -266,10 +280,17 @@ class AIController:
         if edge <= 0.02:
             return aim_pos
         center = self._arena_center(arena_rect)
-        bias = edge * config.AI_ARENA_CENTER_BIAS_MAX
+        bias = edge * config.AI_ARENA_CENTER_BIAS_MAX * bias_scale
         return (
             aim_pos[0] * (1.0 - bias) + center[0] * bias,
             aim_pos[1] * (1.0 - bias) + center[1] * bias,
+        )
+
+    def _is_heavy_duel(self, ship: Ship, target: Ship, opponents: list[Ship]) -> bool:
+        return (
+            len(opponents) == 1
+            and ship.variant == ShipVariant.HEAVY
+            and target.variant == ShipVariant.HEAVY
         )
 
     def _steer_from_aim(self, ship: Ship, aim_pos: Vec2) -> tuple[float, float, float]:
@@ -277,12 +298,137 @@ class AIController:
         dy = aim_pos[1] - ship.position[1]
         desired = math.atan2(dy, dx)
         angle_diff = self._angle_diff(ship.angle, desired)
-        rotate_dir = 0.0
-        if angle_diff > 0.15:
-            rotate_dir = 1.0
-        elif angle_diff < -0.15:
-            rotate_dir = -1.0
+        rotate_dir = self._rotate_toward_diff(angle_diff)
         return angle_diff, rotate_dir, desired
+
+    def _rotate_toward_diff(self, angle_diff: float, gate: float = 0.15) -> float:
+        if angle_diff > gate:
+            return 1.0
+        if angle_diff < -gate:
+            return -1.0
+        return 0.0
+
+    def _bearing_to(self, ship: Ship, pos: Vec2) -> float:
+        dx = pos[0] - ship.position[0]
+        dy = pos[1] - ship.position[1]
+        return math.atan2(dy, dx)
+
+    def _shot_alignment_bearing(
+        self, ship: Ship, target: Ship, rel: Vec2
+    ) -> float:
+        return abs(self._angle_diff(ship.angle, math.atan2(rel[1], rel[0])))
+
+    def _update_target_track(self, target: Ship, dt: float) -> None:
+        track = self._target_tracks.get(target.ship_id)
+        if track is None or not track.initialized:
+            self._target_tracks[target.ship_id] = TargetMotionTrack(
+                last_velocity=target.velocity,
+                last_angular_velocity=target.angular_velocity,
+                initialized=True,
+            )
+            return
+        if dt <= 0.0:
+            return
+        inv_dt = 1.0 / dt
+        raw_accel = (
+            (target.velocity[0] - track.last_velocity[0]) * inv_dt,
+            (target.velocity[1] - track.last_velocity[1]) * inv_dt,
+        )
+        blend = config.AI_PREDICT_ACCEL_BLEND
+        track.velocity_delta = (
+            track.velocity_delta[0] * (1.0 - blend) + raw_accel[0] * blend,
+            track.velocity_delta[1] * (1.0 - blend) + raw_accel[1] * blend,
+        )
+        raw_ang_accel = (target.angular_velocity - track.last_angular_velocity) * inv_dt
+        track.angular_accel = track.angular_accel * (1.0 - blend) + raw_ang_accel * blend
+        track.last_velocity = target.velocity
+        track.last_angular_velocity = target.angular_velocity
+
+    def _clamp_predicted_accel(self, accel: Vec2) -> Vec2:
+        mag = vec_len(accel)
+        cap = config.AI_PREDICT_MAX_ACCEL
+        if mag <= cap or mag < 1e-6:
+            return accel
+        scale = cap / mag
+        return (accel[0] * scale, accel[1] * scale)
+
+    def _predict_target_position(
+        self,
+        target: Ship,
+        horizon: float,
+        observer_variant: ShipVariant,
+    ) -> Vec2:
+        if horizon <= 0.0:
+            return target.position
+        track = self._target_tracks.get(target.ship_id)
+        pos = target.position
+        vel = target.velocity
+        accel = (0.0, 0.0)
+        if track is not None and track.initialized:
+            accel = self._clamp_predicted_accel(track.velocity_delta)
+        pred = (
+            pos[0] + vel[0] * horizon + 0.5 * accel[0] * horizon * horizon,
+            pos[1] + vel[1] * horizon + 0.5 * accel[1] * horizon * horizon,
+        )
+        ang_vel = target.angular_velocity
+        if abs(ang_vel) > 0.12:
+            speed = vec_len(vel)
+            if speed > 18.0:
+                future_angle = (
+                    target.angle
+                    + ang_vel * horizon * 0.9
+                    + 0.5 * (track.angular_accel if track else 0.0) * horizon * horizon * 0.35
+                )
+                turned = vec_from_angle(future_angle, speed)
+                turn_blend = min(
+                    config.AI_PREDICT_TURN_BLEND_MAX,
+                    abs(ang_vel) * horizon * config.AI_PREDICT_TURN_SENSITIVITY,
+                )
+                if (
+                    observer_variant == ShipVariant.HEAVY
+                    or target.variant == ShipVariant.HEAVY
+                ):
+                    turn_blend = min(
+                        config.AI_PREDICT_TURN_BLEND_MAX,
+                        turn_blend * config.AI_PREDICT_HEAVY_TURN_MULT,
+                    )
+                blended_vel = (
+                    vel[0] * (1.0 - turn_blend) + turned[0] * turn_blend,
+                    vel[1] * (1.0 - turn_blend) + turned[1] * turn_blend,
+                )
+                pred = (
+                    pos[0]
+                    + blended_vel[0] * horizon
+                    + 0.5 * accel[0] * horizon * horizon * 0.65,
+                    pos[1]
+                    + blended_vel[1] * horizon
+                    + 0.5 * accel[1] * horizon * horizon * 0.65,
+                )
+        return pred
+
+    def _aim_when_behind(
+        self,
+        ship: Ship,
+        target: Ship,
+        rel: Vec2,
+        arena_rect: tuple[float, float, float, float] | None,
+        misaligned: bool,
+    ) -> Vec2:
+        """Prefer a short turn to the target; only lead when already lined up."""
+        if misaligned:
+            horizon = min(
+                config.AI_PREDICT_AIM_HORIZON_MAX,
+                self._shot_alignment_bearing(ship, target, rel) * 0.14,
+            )
+            return self._predict_target_position(target, horizon, ship.variant)
+        lead = self.lead_target(ship, target, arena_rect)
+        lead_bearing = self._bearing_to(ship, lead)
+        direct_bearing = math.atan2(rel[1], rel[0])
+        if abs(self._angle_diff(ship.angle, lead_bearing)) <= (
+            abs(self._angle_diff(ship.angle, direct_bearing)) + 0.12
+        ):
+            return lead
+        return target.position
 
     def _target_delta(
         self,
@@ -463,10 +609,7 @@ class AIController:
         if dist < 1:
             return target.position
         bullet_time = dist / projectile_speed_for_variant(shooter.variant)
-        return vec_add(
-            shooter.position,
-            vec_add(rel, vec_scale(target.velocity, bullet_time)),
-        )
+        return self._predict_target_position(target, bullet_time, shooter.variant)
 
     def _is_behind_target(self, ship: Ship, target: Ship, rel: Vec2) -> bool:
         """True when ship sits in the target's rear arc (safe tail shot)."""
@@ -804,6 +947,7 @@ class AIController:
             self.last_context = AIDecisionContext(mode="wander", rotate=rot)
             return (rot, 0.0, False)
 
+        self._update_target_track(target, dt)
         rel_to_target = self._target_delta(ship, target, arena_rect)
         dist = vec_len(rel_to_target)
         opponents = self._living_opponents(ship, others)
@@ -811,6 +955,8 @@ class AIController:
             ship, target, dist, rel_to_target, obs, arena_rect
         )
         behind_target = self._is_behind_target(ship, target, rel_to_target)
+        shot_bearing = self._shot_alignment_bearing(ship, target, rel_to_target)
+        misaligned_shot = shot_bearing > config.AI_SHOT_ALIGN_BEARING
         closing = self._radial_speed(ship, rel_to_target)
         caution = self._retreat_urgency(ship, target, dist, rel_to_target)
         shield_ramming = (
@@ -860,9 +1006,13 @@ class AIController:
                 pickup_bias = min(0.48, pu_score - 0.08)
 
         tail_gunner = (
-            ship.health < ship.max_health * 0.52
-            and behind_target
+            behind_target
             and not seeking_powerup
+            and not shield_ramming
+            and (
+                ship.health < ship.max_health * 0.52
+                or misaligned_shot
+            )
         )
         if tail_gunner:
             panicking = False
@@ -872,6 +1022,7 @@ class AIController:
             and not panicking
             and not shield_ramming
             and not tail_gunner
+            and not (behind_target and misaligned_shot)
             and not seeking_powerup
         )
 
@@ -888,6 +1039,28 @@ class AIController:
             and dist > 300
             and caution < 0.2
         )
+        heavy_duel = (
+            self._is_heavy_duel(ship, target, opponents)
+            and ship.health >= ship.max_health * 0.35
+            and not panicking
+            and not shield_ramming
+            and not seeking_powerup
+            and not tail_gunner
+        )
+        if heavy_duel:
+            if abs(dist - self.last_dist) < 14.0 and abs(closing) < 35.0:
+                self.heavy_duel_stale_timer += dt
+            else:
+                self.heavy_duel_stale_timer = max(
+                    0.0, self.heavy_duel_stale_timer - dt * 0.6
+                )
+            if self.heavy_duel_stale_timer >= config.AI_HEAVY_DUEL_COMMIT_AFTER:
+                self.heavy_duel_commit_timer = config.AI_HEAVY_DUEL_COMMIT_DURATION
+                self.heavy_duel_stale_timer = 0.0
+        else:
+            self.heavy_duel_stale_timer = max(0.0, self.heavy_duel_stale_timer - dt)
+        self.heavy_duel_commit_timer = max(0.0, self.heavy_duel_commit_timer - dt)
+
         solo_dogfight = (
             len(opponents) == 1
             and ship.health >= ship.max_health * 0.35
@@ -896,6 +1069,10 @@ class AIController:
             and not shield_ramming
             and not seeking_powerup
             and not tail_gunner
+            and not heavy_duel
+        )
+        center_bias_scale = (
+            config.AI_HEAVY_DUEL_CENTER_BIAS if heavy_duel else 1.0
         )
 
         if shield_ramming:
@@ -905,7 +1082,9 @@ class AIController:
                 else self.lead_target(ship, target, arena_rect)
             )
         elif tail_gunner:
-            aim_pos = self.lead_target(ship, target, arena_rect)
+            aim_pos = self._aim_when_behind(
+                ship, target, rel_to_target, arena_rect, misaligned_shot
+            )
         elif seeking_powerup and pickup:
             aim_pos = pickup[0].position
         elif reengage or (kiting and dist > 320):
@@ -921,6 +1100,8 @@ class AIController:
             aim_pos = self.lead_target(ship, target, arena_rect)
         elif kiting:
             aim_pos = self._kite_point(ship, target, dist, obs)
+        elif heavy_duel and self.heavy_duel_commit_timer > 0:
+            aim_pos = self._predict_target_position(target, 0.32, ship.variant)
         else:
             aim_pos = self.lead_target(ship, target, arena_rect)
         if pickup_bias > 0 and pickup and not seeking_powerup:
@@ -941,7 +1122,9 @@ class AIController:
                 aim_pos[1] + avoid[1] * scale,
             )
 
-        aim_pos = self._bias_aim_toward_center(ship, aim_pos, arena_rect)
+        aim_pos = self._bias_aim_toward_center(
+            ship, aim_pos, arena_rect, center_bias_scale
+        )
         angle_diff, rotate_dir, _ = self._steer_from_aim(ship, aim_pos)
         turn_gate = 0.08 if shield_ramming else 0.15
         if abs(angle_diff) <= turn_gate:
@@ -991,6 +1174,7 @@ class AIController:
             and not shield_ramming
             and not seeking_powerup
             and not tail_gunner
+            and not (behind_target and misaligned_shot)
         ):
             breaking_orbit = True
             self.orbit_break_timer += dt
@@ -1047,7 +1231,9 @@ class AIController:
             aim_pos = (aim_pos[0] + jitter[0], aim_pos[1] + jitter[1])
             self.jitter_timer = random.uniform(0.25, 0.55)
 
-        aim_pos = self._bias_aim_toward_center(ship, aim_pos, arena_rect)
+        aim_pos = self._bias_aim_toward_center(
+            ship, aim_pos, arena_rect, center_bias_scale
+        )
         angle_diff, rotate_dir, _ = self._steer_from_aim(ship, aim_pos)
         turn_gate = 0.08 if shield_ramming else 0.15
         if abs(angle_diff) <= turn_gate:
@@ -1081,7 +1267,10 @@ class AIController:
             strafe = self.flank_sign * 0.95
         elif tail_gunner:
             thrust = 0.42 if dist > 180 else 0.22
-            strafe = self.flank_sign * 0.35
+            if misaligned_shot and abs(angle_diff) > 0.35:
+                strafe = rotate_dir * 0.28
+            else:
+                strafe = self.flank_sign * 0.2
         elif reengage or (kiting and dist > 320):
             thrust = 0.7 if dist > 400 else 0.5
             strafe = self.flank_sign * 0.6
@@ -1105,6 +1294,34 @@ class AIController:
                 thrust = 0.38
             thrust = self._blend_range_thrust(ship, dist, thrust)
             strafe = self.flank_sign * 1.0
+        elif heavy_duel and not breaking_orbit:
+            ideal = self._ideal_weapon_range(ship)
+            inner = config.AI_RANGE_INNER_TOLERANCE
+            outer = config.AI_RANGE_OUTER_TOLERANCE
+            if dist < 235 and closing > 38:
+                thrust = -0.48
+                strafe = self.break_orbit_sign * 0.95
+            elif dist < 320 and closing < -52:
+                thrust = config.AI_HEAVY_DUEL_COMMIT_THRUST
+                strafe = self.flank_sign * 0.1
+            elif self.heavy_duel_commit_timer > 0 and dist > 260:
+                thrust = config.AI_HEAVY_DUEL_COMMIT_THRUST
+                strafe = self.flank_sign * 0.08
+            elif dist > ideal + outer:
+                thrust = 0.88
+                strafe = self.flank_sign * 0.1
+            elif dist > ideal + inner * 0.55:
+                thrust = config.AI_HEAVY_DUEL_CLOSE_THRUST
+                strafe = self.flank_sign * 0.14
+            elif dist < ideal - inner:
+                thrust = -0.22
+                strafe = self.flank_sign * 0.42
+            else:
+                thrust = config.AI_HEAVY_DUEL_BAND_THRUST
+                strafe = self.flank_sign * 0.36
+            if closing < -18.0:
+                thrust = max(thrust, config.AI_HEAVY_DUEL_COMMIT_THRUST)
+                strafe *= 0.22
         elif not breaking_orbit:
             health_ratio = ship.health / ship.max_health
             if self.personality == Personality.AGGRESSIVE:
@@ -1191,6 +1408,19 @@ class AIController:
             if self._in_weapon_sweet_spot(ship, dist):
                 cone = 0.72
             should_fire = should_fire and abs(self._angle_diff(ship.angle, to_target)) < cone
+        elif heavy_duel:
+            cone = 0.92 if dist > 360 else 0.78
+            should_fire = (
+                has_los
+                and dist < fire_range
+                and (
+                    abs(self._angle_diff(ship.angle, to_target)) < cone
+                    or (
+                        self._in_weapon_sweet_spot(ship, dist)
+                        and target_bearing < 1.05
+                    )
+                )
+            )
         elif breaking_orbit:
             in_force_range = has_los and dist < config.ORBIT_BREAK_FORCE_FIRE_RANGE
             if orbit_force_shot:
@@ -1217,7 +1447,12 @@ class AIController:
         else:
             self.stuck_timer = max(0.0, self.stuck_timer - dt * 2)
 
-        if self.stuck_timer > 0.8 and not shield_ramming:
+        if (
+            self.stuck_timer > 0.8
+            and not shield_ramming
+            and not tail_gunner
+            and not heavy_duel
+        ):
             thrust = -0.8
             strafe = self.flank_sign
             rotate_dir = -rotate_dir if rotate_dir != 0 else self.flank_sign
@@ -1258,6 +1493,8 @@ class AIController:
             mode = "kite"
         elif breaking_orbit:
             mode = "orbit_break"
+        elif heavy_duel:
+            mode = "heavy_duel"
         else:
             mode = "fight"
         self.last_context = AIDecisionContext(
@@ -1272,6 +1509,7 @@ class AIController:
             shield_ramming=shield_ramming,
             seeking_powerup=seeking_powerup,
             breaking_orbit=breaking_orbit,
+            heavy_duel=heavy_duel,
             engage_quality=engage_quality,
             rotate=rotate_dir,
             thrust=thrust,

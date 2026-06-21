@@ -16,7 +16,7 @@ from game import GameMode, GameState, Phase
 from scores import HighScoreTable
 from settings import GameSettings
 from ship import ShipVariant
-from audio import SoundManager
+from audio import MusicManager, SoundManager
 
 # Colors
 BG = (0, 0, 0)
@@ -76,11 +76,14 @@ class VeilApp:
         self.scores.load()
         self.audio = SoundManager()
         self.audio.init()
-        self.audio.enabled = self.settings.sounds_enabled
+        self.audio.sfx_volume = self.settings.sfx_volume
+        self.music = MusicManager()
+        self.music.init()
+        self.music.set_volume(self.settings.music_volume)
 
         self.rebind_action: Action | None = None
         self._ctrl_idx = Action.ROTATE_LEFT
-        self._ctrl_sounds_selected = False
+        self._ctrl_volume_row: str | None = None
 
         self.menu_selection = 1  # 0=light, 1=balanced, 2=heavy, 3=ai arena, 4=quit
         self.pause_selection = 0
@@ -142,26 +145,26 @@ class VeilApp:
                         ShipVariant.HEAVY,
                     ]
                     self.state.start_human(variants[self.menu_selection])
-                self.ui = UiState.PLAYING
+                self._set_ui(UiState.PLAYING)
             elif event.key == pygame.K_ESCAPE:
                 pygame.event.post(pygame.event.Event(pygame.QUIT))
 
     def _playing_event(self, event: pygame.event.Event) -> None:
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-            self.ui = UiState.PAUSED
+            self._set_ui(UiState.PAUSED)
             self.pause_selection = 0
             self.audio.play("ui")
             return
         action = self.bindings.action_down(event)
         if action == Action.PAUSE:
-            self.ui = UiState.PAUSED
+            self._set_ui(UiState.PAUSED)
             self.pause_selection = 0
             self.audio.play("ui")
         elif action == Action.QUIT:
             pygame.event.post(pygame.event.Event(pygame.QUIT))
         elif action == Action.TOGGLE_AI_ARENA:
             self.state.toggle_ai_arena()
-            self.ui = UiState.PLAYING
+            self._set_ui(UiState.PLAYING)
 
     def _pause_event(self, event: pygame.event.Event) -> None:
         if event.type == pygame.KEYDOWN:
@@ -172,23 +175,23 @@ class VeilApp:
             elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
                 self._pause_activate()
             elif event.key == pygame.K_ESCAPE:
-                self.ui = UiState.PLAYING
+                self._set_ui(UiState.PLAYING)
             elif event.key == pygame.K_p:
-                self.ui = UiState.PLAYING
+                self._set_ui(UiState.PLAYING)
 
     def _pause_activate(self) -> None:
         opts = ["resume", "controls", "ai_arena", "quit"]
         choice = opts[self.pause_selection]
         if choice == "resume":
-            self.ui = UiState.PLAYING
+            self._set_ui(UiState.PLAYING)
         elif choice == "controls":
-            self.ui = UiState.CONTROLS
+            self._set_ui(UiState.CONTROLS)
             self.rebind_action = None
-            self._ctrl_sounds_selected = False
+            self._ctrl_volume_row = None
             self._ctrl_idx = Action.ROTATE_LEFT
         elif choice == "ai_arena":
             self.state.toggle_ai_arena()
-            self.ui = UiState.PLAYING
+            self._set_ui(UiState.PLAYING)
             self.audio.play("ui")
         elif choice == "quit":
             pygame.event.post(pygame.event.Event(pygame.QUIT))
@@ -196,7 +199,7 @@ class VeilApp:
     def _controls_event(self, event: pygame.event.Event) -> None:
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
-                self.ui = UiState.PAUSED
+                self._set_ui(UiState.PAUSED)
                 return
             if event.key == pygame.K_r:
                 self.bindings.restore_defaults()
@@ -205,31 +208,46 @@ class VeilApp:
                 return
             if self.rebind_action is None:
                 if event.key in (pygame.K_UP, pygame.K_w):
-                    if self._ctrl_sounds_selected:
-                        self._ctrl_sounds_selected = False
-                        self._ctrl_idx = list(Action)[-1]
-                    else:
+                    if self._ctrl_volume_row == "music":
+                        self._ctrl_volume_row = "sfx"
+                    elif self._ctrl_volume_row is None:
                         idx = list(Action).index(self._ctrl_idx)
                         if idx == 0:
-                            self._ctrl_sounds_selected = True
+                            self._ctrl_volume_row = "music"
                         else:
                             self._ctrl_idx = list(Action)[idx - 1]
                 elif event.key in (pygame.K_DOWN, pygame.K_s):
-                    if self._ctrl_sounds_selected:
-                        self._ctrl_sounds_selected = False
+                    if self._ctrl_volume_row == "sfx":
+                        self._ctrl_volume_row = "music"
+                    elif self._ctrl_volume_row == "music":
+                        self._ctrl_volume_row = None
                         self._ctrl_idx = list(Action)[0]
                     else:
                         idx = list(Action).index(self._ctrl_idx)
-                        if idx == len(Action) - 1:
-                            self._ctrl_sounds_selected = True
-                        else:
+                        if idx < len(Action) - 1:
                             self._ctrl_idx = list(Action)[idx + 1]
-                elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
-                    if self._ctrl_sounds_selected:
-                        enabled = self.settings.toggle_sounds()
-                        self.audio.enabled = enabled
+                elif event.key in (pygame.K_LEFT, pygame.K_a):
+                    if self._ctrl_volume_row == "sfx":
+                        self.settings.adjust_sfx_volume(-config.VOLUME_STEP)
+                        self.audio.sfx_volume = self.settings.sfx_volume
                         self.audio.play("ui")
-                    else:
+                    elif self._ctrl_volume_row == "music":
+                        self.settings.adjust_music_volume(-config.VOLUME_STEP)
+                        self.music.set_volume(self.settings.music_volume)
+                        self._sync_music()
+                        self.audio.play("ui")
+                elif event.key in (pygame.K_RIGHT, pygame.K_d):
+                    if self._ctrl_volume_row == "sfx":
+                        self.settings.adjust_sfx_volume(config.VOLUME_STEP)
+                        self.audio.sfx_volume = self.settings.sfx_volume
+                        self.audio.play("ui")
+                    elif self._ctrl_volume_row == "music":
+                        self.settings.adjust_music_volume(config.VOLUME_STEP)
+                        self.music.set_volume(self.settings.music_volume)
+                        self._sync_music()
+                        self.audio.play("ui")
+                elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    if self._ctrl_volume_row is None:
                         self.rebind_action = self._ctrl_idx
             return
         binding = self.bindings.binding_from_event(event)
@@ -241,9 +259,24 @@ class VeilApp:
             self.rebind_action = None
 
     def _return_to_menu(self) -> None:
-        self.ui = UiState.MENU
+        self._set_ui(UiState.MENU)
         self.state.phase = Phase.MENU
         self._game_over_saved = False
+
+    def _set_ui(self, ui: UiState) -> None:
+        self.ui = ui
+        self._sync_music()
+
+    def _sync_music(self) -> None:
+        if self.ui == UiState.PLAYING:
+            if self.settings.music_volume > 0.0 and self.music.has_tracks():
+                self.music.unpause()
+            else:
+                self.music.stop()
+        elif self.ui in (UiState.PAUSED, UiState.CONTROLS):
+            self.music.pause()
+        else:
+            self.music.stop()
 
     def _game_over_event(self, event: pygame.event.Event) -> None:
         if event.type == pygame.KEYDOWN:
@@ -280,11 +313,12 @@ class VeilApp:
         }
         self.state.update(dt, actions)
         self.audio.tick(dt)
+        self.music.tick(dt)
         if self.state.phase == Phase.PLAYING:
             self.audio.play_batch(self.state.pending_sounds)
 
         if self.state.phase == Phase.GAME_OVER:
-            self.ui = UiState.GAME_OVER
+            self._set_ui(UiState.GAME_OVER)
             if not self._game_over_saved:
                 self.scores.add(
                     self.state.score,
@@ -723,36 +757,70 @@ class VeilApp:
             surf = self.font.render(f"{prefix}{item}", True, color)
             self.screen.blit(surf, surf.get_rect(center=(self.screen.get_width() // 2, 300 + i * 40)))
 
+    def _draw_volume_slider(
+        self,
+        label: str,
+        volume: float,
+        y: int,
+        selected: bool,
+    ) -> None:
+        pct = int(volume * 100)
+        prefix = "> " if selected else "  "
+        color = ACCENT if selected else TEXT
+        text = self.font.render(f"{prefix}{label}: {pct}%", True, color)
+        self.screen.blit(text, (60, y))
+        bar_x, bar_y, bar_w, bar_h = 340, y + 6, 220, 10
+        pygame.draw.rect(self.screen, (40, 40, 55), (bar_x, bar_y, bar_w, bar_h))
+        fill_w = int(bar_w * volume)
+        if fill_w > 0:
+            pygame.draw.rect(self.screen, color, (bar_x, bar_y, fill_w, bar_h))
+
     def _draw_controls(self) -> None:
         self.screen.fill(MENU_BG)
         title = self.font_lg.render("CONTROLS", True, ACCENT)
         self.screen.blit(title, (40, 30))
         hint = self.font_sm.render(
-            "Up/Down select — Enter rebind/toggle — R restore defaults — Esc back",
+            "Up/Down select — Left/Right volume — Enter rebind — R restore — Esc back",
             True,
             (140, 140, 150),
         )
         self.screen.blit(hint, (40, 80))
-        snd_label = "ON" if self.settings.sounds_enabled else "OFF"
-        snd_color = ACCENT if self._ctrl_sounds_selected and not self.rebind_action else TEXT
-        snd_prefix = "> " if self._ctrl_sounds_selected and not self.rebind_action else "  "
-        snd_surf = self.font.render(f"{snd_prefix}Sounds: {snd_label}", True, snd_color)
-        self.screen.blit(snd_surf, (60, 130))
+        vol_selected = self._ctrl_volume_row is not None and not self.rebind_action
+        self._draw_volume_slider(
+            "SFX volume",
+            self.settings.sfx_volume,
+            120,
+            vol_selected and self._ctrl_volume_row == "sfx",
+        )
+        self._draw_volume_slider(
+            "Music volume",
+            self.settings.music_volume,
+            152,
+            vol_selected and self._ctrl_volume_row == "music",
+        )
+        if not self.music.has_tracks():
+            note = self.font_sm.render(
+                f"No tracks in {config.MUSIC_DIR}/ — add .mp3 files to enable music",
+                True,
+                (120, 120, 130),
+            )
+            self.screen.blit(note, (60, 178))
         if self.rebind_action:
             msg = self.font.render(
                 f"Press key, mouse button, or wheel for {ACTION_LABELS[self.rebind_action]}...",
                 True,
                 (255, 220, 100),
             )
-            self.screen.blit(msg, (40, 120))
+            self.screen.blit(msg, (40, 200))
         idx = self._ctrl_idx
+        binding_y = 210 if self.music.has_tracks() else 228
         for i, action in enumerate(Action):
             b = self.bindings.bindings[action]
             color = ACCENT if action == idx and not self.rebind_action else TEXT
             prefix = "> " if action == idx and not self.rebind_action else "  "
             line = f"{prefix}{ACTION_LABELS[action]}: {b.label}"
             surf = self.font.render(line, True, color)
-            self.screen.blit(surf, (60, 170 + i * 32))
+            self.screen.blit(surf, (60, binding_y + i * 32))
 
     def _draw_game_over(self) -> None:
         overlay = pygame.Surface(self.screen.get_size(), pygame.SRCALPHA)
