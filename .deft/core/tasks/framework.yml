@@ -1,0 +1,74 @@
+version: '3'
+
+# tasks/framework.yml -- framework-level introspection / upkeep tasks (#801).
+#
+# Hosts surfaces that interrogate the deft framework itself (rather than the
+# consumer project). Currently only `framework:check-updates`, but this is
+# the natural home for any future "is the deft framework healthy / current"
+# probe (e.g. submodule SHA reconcile, .deft/core/run version vs marker, etc.).
+#
+# Per `conventions/task-caching.md` (#574): the check-updates task accepts a
+# user-facing `--force` recovery flag (mapped to DEFT_FORCE_REMOTE_PROBE=1)
+# and therefore MUST NOT declare `sources:` / `generates:` -- the cached
+# `cmds:` skip would silently discard the recovery flag.
+
+vars:
+  DEFT_ROOT: '{{joinPath .TASKFILE_DIR ".."}}'
+
+tasks:
+  check-updates:
+    desc: "Read-only remote-version probe (#801) -- task framework:check-updates [-- --force | --json]. Honors DEFT_NO_NETWORK=1 and DEFT_REMOTE_PROBE_TIMEOUT (default 5s)."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+      # When the operator passes `--force`, the task wrapper sets
+      # DEFT_FORCE_REMOTE_PROBE=1 so the gate-integration helper bypasses
+      # the 24h throttle. The `run` CLI surface (`run check-updates`) is
+      # already idempotent (does not write to the throttle file), so this
+      # env var only affects callers that probe through the upgrade gate.
+      DEFT_FORCE_REMOTE_PROBE: '{{if (mustRegexMatch "(^|\\s)--force(\\s|$)" .CLI_ARGS)}}1{{else}}{{.DEFT_FORCE_REMOTE_PROBE | default ""}}{{end}}'
+    cmds:
+      # Strip our own `--force` from the args we pass through to `run` so it
+      # does not surface as an unknown flag in the JSON / text output. Other
+      # supported flags (e.g. `--json`) flow through unchanged.
+      #
+      # #1059: invoke Python through `uv --project "{{.DEFT_ROOT}}" run python`
+      # rather than a bare `python3`. On Windows the bare `python3` command
+      # resolves to the Microsoft Store app-execution-alias stub (exit 49) on
+      # default-configured hosts where the user installed Python via the
+      # official installer, so the wrapper aborted before `run check-updates`
+      # ever started. The `uv` wrapper matches the canonical pattern used by
+      # every other tasks/*.yml file (see e.g. `tasks/prd.yml`,
+      # `tasks/vbrief.yml`) and pins the project root via #1011 so the
+      # uv environment never walks up into a hostile ancestor pyproject.
+      - >-
+        uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/run" check-updates
+        {{regexReplaceAll "(^|\\s)--force(\\s|$)" .CLI_ARGS " "}}
+
+  doctor:
+    # #1272: the legacy ``task framework:doctor`` surface is REDACTED.
+    # ``task doctor`` (root Taskfile.yml shim for ``.deft/core/run doctor``)
+    # is now the canonical doctor entry point and owns the install-integrity
+    # probe, the root Taskfile.yml include diagnostics, and the optional
+    # interactive repair path. This shim prints a single-line redaction
+    # notice and exits 0 so legacy callers do not crash, while operators are
+    # nudged at the canonical surface. The Python probe at
+    # ``scripts/framework_doctor.py`` is still exercised internally by the
+    # upgrade gate's ``_maybe_run_framework_doctor`` advisory; nothing about
+    # that pathway changes.
+    desc: "Deprecated doctor surface (#1272) -- prints redaction; use `task doctor` (or `.deft/core/run doctor`) instead."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      # Cross-platform redaction line. go-task runs every ``cmd:`` through
+      # its embedded mvdan/sh POSIX-sh interpreter on every host (Windows,
+      # macOS, Linux), so a single ``echo`` invocation is portable and
+      # strips the surrounding quotes uniformly -- emitting exactly:
+      #     redacted use run doctor instead
+      # The previous Windows branch shelled out to ``pwsh`` (PowerShell 7+),
+      # which is NOT present on stock Windows 10 / 11 (only ``powershell.exe``
+      # ships out of the box) so any consumer without PowerShell 7+ installed
+      # would see ``pwsh: not found`` instead of the redaction notice. Letting
+      # mvdan/sh handle the echo sidesteps the shell-dependence entirely.
+      - echo "redacted use run doctor instead"

@@ -1,0 +1,124 @@
+# Distribution
+dist/
+
+# Backup files
+backup/
+
+# Node modules (if using markdown linting)
+node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.tmp
+*.bak
+
+# Transient agent scratch directory (PR #401 trim arc convention -- see #642)
+temp/
+
+# User-specific files (users should copy from templates)
+core/user.md
+
+# Go build artifacts
+*.exe
+
+# Python toolchain
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.coverage
+htmlcov/
+.pytest_cache/
+*.egg-info/
+
+# Secrets (project-specific)
+secrets/
+
+# vContext state
+vcontext/
+
+# Generated Deft exports
+.deft/
+
+# Pre-cutover backups written by `task migrate:vbrief` (#497, #506 D7).
+# Operators who want these versioned can delete these lines or override per-file.
+*.premigrate.*
+vbrief/*.premigrate.*
+
+# Migration backups (created by `task migrate:vbrief`) -- do NOT commit.
+# Post-commit, pre-migration state is recoverable via git history; see
+# deft/main.md § Safety flags for the post-commit recovery path.
+*.premigrate.md
+*.premigrate.vbrief.json
+
+# Local triage / refinement issue cache (#845 Story 1). Sidecar mirror of
+# `gh issue list` populated by `task triage:cache`; never versioned. See
+# scripts/triage_cache.py for the layout (.deft-cache/issues/<owner>-<repo>/).
+.deft-cache/
+
+# vbrief/.eval/ tracking governance (#1144, N4 of #1119).
+# Hybrid policy from the Current Shape comment on #1144:
+#   - candidates.jsonl       -> gitignored (operator-private triage decisions;
+#                               re-derive via `task triage:bootstrap` on a
+#                               fresh clone). #845 Story 2 + #915.
+#   - summary-history.jsonl  -> gitignored (operator-private observability;
+#                               not load-bearing for any decision).
+#   - scope-lifecycle.jsonl  -> gitignored (operator-private scope-lifecycle
+#                               audit decisions; D1 / #1121). Per-operator
+#                               demote stream; sharing would conflate
+#                               operators' demote timing across the team.
+#   - decompositions/        -> gitignored (temporary decomposition proposal
+#                               drafts; generated child story vBRIEFs live in
+#                               lifecycle folders via task scope:decompose).
+#   - slices.jsonl           -> TRACKED (team-shared cohort records produced
+#                               by slicing skills; see #1132 / D13).
+#   - doctor-state.json      -> gitignored (operator-private doctor throttle
+#                               state; persisted by `run doctor` /
+#                               `task doctor` per #1308 to gate the 24h/4h
+#                               re-probe window. Local to each clone; never
+#                               committed).
+# See vbrief/.eval/README.md for the full policy + merge=union rebase note.
+vbrief/.eval/candidates.jsonl
+vbrief/.eval/summary-history.jsonl
+vbrief/.eval/scope-lifecycle.jsonl
+vbrief/.eval/decompositions/
+vbrief/.eval/doctor-state.json
+vbrief/.eval/*.lock
+
+# N6 (#1146) triage:smoketest assert log -- runtime artefact, never committed.
+# The fixture itself (tests/fixtures/triage_smoketest/{issues.json,
+# PROJECT-DEFINITION.vbrief.json, vbrief/, README.md}) IS committed; only the
+# per-run last_run.json output is gitignored.
+tests/fixtures/triage_smoketest/last_run.json
+
+# Monitor scratch (poller scripts, banner-edit helpers, etc.)
+.swarm/
+
+# Scratch automation + issue/PR bodies in history/ (WD AI guideline: "prior tasks -> history/").
+# These accumulate as one-off helpers per session; never versioned.
+history/_*
+history/issue-*
+history/*.json
+history/post-issue.py
+
+# One-off operator scripts left at root from prior sessions -- move to history/ or delete.
+poll-fetch.ps1
+vbrief/PROJECT-DEFINITION.vbrief.json.lock
+
+# Per-session scratch root files left by orchestrator/swarm handoffs --
+# move to history/ or delete; never committed.
+.deft-scratch/
+docs/incidents/
+handoff-*.md
+epic_full_body.md
+swarm_grok_issue.md

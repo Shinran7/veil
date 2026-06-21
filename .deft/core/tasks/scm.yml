@@ -1,0 +1,126 @@
+version: '3'
+
+# ---------------------------------------------------------------------------
+# scm.yml -- STUB for #883 v1 cache layer (Story 1) + #976 REST opt-in + #1555 safe body posting.
+#
+# DO NOT EXTEND except for the narrow #1555 body-posting carve-out below.
+#
+# The full scm:* task namespace lives at #881; this file is replaced wholesale
+# when #881 lands. The stub exposes the minimum surface the #883 v1 cache
+# consumer (Story 2 cache:fetch-all) needs:
+#
+#   - scm:issue:list    (thin wrapper over `ghx|gh issue list`)
+#   - scm:issue:view    (thin wrapper over `ghx|gh issue view`)
+#   - scm:issue:close   (thin wrapper over `ghx|gh issue close`)
+#   - scm:issue:edit    (thin wrapper over `ghx|gh issue edit`)
+#   - scm:body:*        (#1555 safe Markdown body posting via scripts/github_body.py)
+#
+# Each command is a thin pass-through to `ghx <verb>` (when ghx is on PATH)
+# or `gh <verb>` (fallback). Output JSON via the consumer-supplied --json
+# flag. The JSON-shape contract Story 2 depends on is pinned by the
+# tests/test_scm_contract.py contract test against tests/fixtures/scm_issue_view.json.
+#
+# REST opt-in (#976): callers may pass `--rest` to scm:issue:view /
+# scm:issue:list to route the read through scripts/gh_rest.py REST
+# helpers (rest_issue_view / rest_issue_list) instead of forwarding to
+# `ghx|gh issue view|list`. This sidesteps the GraphQL bucket entirely so
+# a depleted graphql.remaining no longer fails read-only smoke / cache
+# flows. The REST shape differs from the gh --json GraphQL shape (REST
+# emits user/created_at/lowercase state vs GraphQL author/createdAt/
+# uppercase state); only callers that opt in see the REST shape. Story 2
+# cache:fetch-all keeps the legacy (GraphQL) path until #881. Mutations
+# (close, edit) keep forwarding to gh -- they have non-trivial flag
+# surfaces (--body-file, --add-label, --remove-label, ...) that this
+# stub deliberately does not re-implement; #881 owns the full surface.
+#
+# Forward-compat marker: the ONLY scm:* surface in v1 is the four issue:*
+# commands above plus the #1555 body-posting safety wrapper. PR commands
+# (scm:pr:list/view/merge/close) and any additional scm:* surface are
+# EXPLICITLY deferred to #881; do not add them here. See
+# vbrief/active/2026-05-05-883-story-1-scm-stub.vbrief.json for the full
+# Story 1 scope and vbrief/active/2026-05-05-883-deft-cache-quarantine-v1.vbrief.json
+# for the epic chain context.
+# ---------------------------------------------------------------------------
+
+vars:
+  # Each included sub-taskfile defines its own DEFT_ROOT mirror so scripts
+  # can be dispatched via {{.DEFT_ROOT}}/scripts/<name>.py on every platform
+  # (#566). joinPath is evaluated eagerly by go-task templating and yields
+  # a native-separator absolute path that uv --project "{{.DEFT_ROOT}}" run python can open on Windows.
+  DEFT_ROOT: '{{joinPath .TASKFILE_DIR ".."}}'
+
+# Per `conventions/task-caching.md` (#574): tasks that accept user-facing
+# CLI args via {{.CLI_ARGS}} MUST NOT declare `sources:` / `generates:` --
+# the cached cmds skip would silently discard the recovery flag.
+tasks:
+  issue:list:
+    desc: "[#883 stub] List issues -- task scm:issue:list -- [--rest] --repo OWNER/NAME --json number,title,state,updatedAt [--state ...] (#976 --rest routes via REST helpers; default forwards to ghx|gh)"
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/scm.py" issue list {{.CLI_ARGS}}
+
+  issue:view:
+    desc: "[#883 stub] View an issue -- task scm:issue:view -- [--rest] <N> --repo OWNER/NAME --json number,title,body,state,author,createdAt,updatedAt,labels,comments (#976 --rest routes via REST helpers and emits REST shape; default forwards to ghx|gh GraphQL shape)"
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/scm.py" issue view {{.CLI_ARGS}}
+
+  issue:close:
+    desc: "[#883 stub] Close an issue -- task scm:issue:close -- <N> --repo OWNER/NAME [--comment ...]"
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/scm.py" issue close {{.CLI_ARGS}}
+
+  issue:edit:
+    desc: "[#883 stub] Edit an issue -- task scm:issue:edit -- <N> --repo OWNER/NAME [--add-label ...] [--body ...]"
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/scm.py" issue edit {{.CLI_ARGS}}
+
+  body:issue:create:
+    desc: "[#1555] Safely create an issue body from --body-file without shell Markdown interpolation"
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/github_body.py" issue-create {{.CLI_ARGS}}
+
+  body:issue:edit:
+    desc: "[#1555] Safely edit an issue body from --body-file and live gh read-back"
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/github_body.py" issue-edit {{.CLI_ARGS}}
+
+  body:comment:create:
+    desc: "[#1555] Safely create an issue/PR comment body from --body-file and live gh read-back"
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/github_body.py" comment-create {{.CLI_ARGS}}
+
+  body:comment:edit:
+    desc: "[#1555] Safely edit an issue comment body from --body-file and live gh read-back"
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/github_body.py" comment-edit {{.CLI_ARGS}}
+
+  body:pr:edit:
+    desc: "[#1555] Safely edit a PR body from --body-file and live gh read-back"
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/github_body.py" pr-edit {{.CLI_ARGS}}

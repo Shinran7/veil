@@ -1,0 +1,52 @@
+# [Project Name] Project Guidelines
+
+Only specify items here that **override or extend** the deft defaults.
+See `deft/main.md`, `deft/coding/coding.md`, and language-specific files for base standards.
+
+**Tech Type**: [CLI / Web / API / Library / TUI]
+**Specification**: [specification.md](./specification.md)
+
+## 📏 Overrides
+
+<!-- Only list deviations from deft defaults. Examples: -->
+<!-- - Coverage: ≥95% (overrides default 85%) -->
+<!-- - Additional task targets unique to this project -->
+
+## 🔐 Secrets
+
+<!-- List project-specific secrets needed -->
+```bash
+cp secrets/[example].example secrets/[example]  # [Description]
+```
+
+## 🎯 Principles
+
+<!-- Non-negotiable rules unique to THIS project (3-5 items). -->
+- ! [Principle 1 — describe]
+- ! [Principle 2 — describe]
+- ⊗ [Anti-principle — what to avoid]
+
+## 📦 Tech Stack
+
+**Language**: [Primary language with version]
+**Framework**: [Main framework if applicable]
+**Database**: [Database if applicable]
+**Deployment**: [Platform/method]
+
+## 📄 Documentation
+
+- **Architecture**: [architecture.md](./docs/architecture.md)
+- **API**: [api.md](./docs/api.md)
+- **Deployment**: [deployment.md](./docs/deployment.md)
+
+## Branching
+
+<!-- Uncomment the line below to allow direct commits to master (trunk-based workflow). -->
+<!-- Allow direct commits to master: true -->
+
+## 🚧 Constraints
+
+<!-- Optional: timeline, compliance, compatibility requirements -->
+- **Timeline**: [deadline if any]
+- **Compatibility**: [supported versions, platforms]
+- **Compliance**: [regulatory requirements if any]

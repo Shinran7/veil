@@ -1,0 +1,29 @@
+# Deft framework: ignore local-only caches and scratch directories
+.deft-cache/
+.deft/ritual-state.json
+.deft/last-session.json
+vbrief/.eval/candidates.jsonl
+vbrief/.eval/summary-history.jsonl
+vbrief/.eval/scope-lifecycle.jsonl
+vbrief/.eval/decompositions/
+vbrief/.eval/doctor-state.json
+vbrief/*.lock
+.deft/core.bak-*/
+.deft/*.bak-*
+*.premigrate.*
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+*.egg-info/
+
+# Local runtime / generated data
+telemetry/runs/
+agent-tools/
+highscores.json
+settings.json
+bindings.json

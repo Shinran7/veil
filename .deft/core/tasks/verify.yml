@@ -1,0 +1,217 @@
+version: '3'
+
+vars:
+  DEFT_ROOT: '{{joinPath .TASKFILE_DIR ".."}}'
+
+tasks:
+  stubs:
+    desc: Scan source files for stub patterns (TODO, FIXME, HACK, return null, bare pass)
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/verify-stubs.py"
+
+  links:
+    desc: Validate internal links in markdown files
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/validate-links.py"
+
+  rule-ownership:
+    desc: "Verify the Rule Ownership Map (conventions/rule-ownership.json) is in sync with its owner files (#635)"
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/rule_ownership_lint.py" --root "{{.DEFT_ROOT}}"
+
+  branch:
+    desc: "Detection-bound branch-protection gate (#747). Reads plan.policy.allowDirectCommitsToMaster from PROJECT-DEFINITION."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      # `--allow-missing-project-definition` keeps the framework's own check
+      # green for fresh checkouts that have not yet run `task setup` (the
+      # bootstrap fallback path documented in #746 acceptance criterion E).
+      # Production projects with PROJECT-DEFINITION present will still get
+      # the full enforcement -- the flag is a no-op when the file exists.
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/preflight_branch.py" --project-root "{{.USER_WORKING_DIR}}" --allow-missing-project-definition
+
+  hooks-installed:
+    desc: "Assert the deft git hooks are installed AND functional -- core.hooksPath set, hooks dir + pre-commit/pre-push present, and the gate scripts resolve in this layout (own-repo or vendored). Fails loud on the #1463 false-green (wired but non-functional). Run `task setup` / re-run the installer if this fails (#747, #1463)."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    # No sources:/generates: -- a cached cmds skip would mask a hooks dir /
+    # gate-script that was deleted after the last run.
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/verify_hooks_installed.py" --project-root "{{.USER_WORKING_DIR}}"
+
+  encoding:
+    desc: "Detect PS 5.1 non-ASCII round-trip corruption (#798). Scans tracked text files for U+FFFD, CP1252/CP437-as-UTF-8 mojibake, and unexpected BOM. Defaults to --all; pass --staged for the pre-commit invocation."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    # Per `conventions/task-caching.md`: NO `sources:` / `generates:` because
+    # user-facing flags (--staged / --all / --allow-list <path>) MUST NOT be
+    # silently swallowed by go-task's incremental-build cache. The same
+    # rationale that gated `task release` (#74) and `task pr:check-protected-issues`
+    # (#702) applies here -- the gate accepts recovery flags that the cache
+    # layer would otherwise discard.
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/verify_encoding.py" --project-root "{{.USER_WORKING_DIR}}" {{.CLI_ARGS}}
+
+  vbrief-conformance:
+    desc: "Detect bare non-conformant vBRIEF keys (#1620). Scans tracked vbrief/**/*.vbrief.json and flags any document/plan/item key that is not 0.6 spec-core, x-directive/-namespaced, or x-vbrief/-namespaced. plan.policy + plan.completedNote carry a TEMPORARY allow-list pending vBRIEF #12. Defaults to --all; pass --staged for the pre-commit invocation."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    # Per `conventions/task-caching.md`: NO `sources:` / `generates:` because
+    # user-facing flags (--staged / --all / --allow-list <path>) MUST NOT be
+    # silently swallowed by go-task's incremental-build cache (same rationale
+    # as verify:encoding above).
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/verify_vbrief_conformance.py" --project-root "{{.USER_WORKING_DIR}}" {{.CLI_ARGS}}
+
+  destructive-gh-verbs:
+    desc: "Detection-bound gate for destructive gh verbs (#1019). Runs scripts/preflight_gh.py --self-test so the fixture-vs-classifier contract fails CI on drift. Override via DEFT_ALLOW_DESTRUCTIVE_GH_VERBS=1 (per-shell emergency bypass)."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    # No sources:/generates: -- the self-test fixture table is the
+    # invariant under test; we want the gate to re-run on every
+    # `task check` invocation regardless of whether the classifier file
+    # mtime moved. Caching here would silently mask a regression.
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/preflight_gh.py" --self-test {{.CLI_ARGS}}
+
+  cache-fresh:
+    desc: "Pre-`start_agent` cache-freshness gate (#1127). Refuses implementation dispatch when the triage cache is stale, missing, or the target issue's latest decision is not `accept`. Subscription-aware via plan.policy.triageScope[] (D12 / #1131). Flags: --for-issue N / --max-age-hours N / --allow-stale / --repo OWNER/NAME / --allow-missing-bootstrap (consumed by the framework's own `task check` so a fresh checkout passes -- consumers leave it OFF)."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    # Per `conventions/task-caching.md` (#574): NO `sources:` / `generates:`
+    # because the gate forwards user-facing flags via {{.CLI_ARGS}}
+    # (--for-issue / --max-age-hours / --allow-stale / --repo) that
+    # go-task's incremental-build cache would silently swallow. The
+    # `--allow-missing-bootstrap` flag below keeps the framework's own
+    # `task check` green on a fresh checkout that has not yet run
+    # `task triage:bootstrap`; consumer projects leave it off so a
+    # missing cache fails their `task check` loudly.
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/preflight_cache.py" --project-root "{{.USER_WORKING_DIR}}" --allow-missing-bootstrap {{.CLI_ARGS}}
+
+  session-ritual:
+    desc: "Fail-closed session ritual verifier (#1348). Flags: --tier quick|gated / --json. Set DEFT_SESSION_RITUAL_SKIP=1 for headless workers and CI."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    # No sources/generates: this gate is time-, HEAD-, and worktree-sensitive.
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/verify_session_ritual.py" --project-root "{{.USER_WORKING_DIR}}" {{.CLI_ARGS}}
+
+  tools:
+    desc: "Detect required Deft host tools and print install or manual guidance (#1187). Flags: --install / --yes / --json"
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/verify_tools.py" {{.CLI_ARGS}}
+
+  scm-boundary:
+    desc: "Detection-bound gate against raw `gh` / `ghx` subprocess calls outside `scripts/scm.py` (#1145 / N5). Scans verb-layer Python files (`scripts/triage_*.py`, `scripts/scope_*.py`, `scripts/slice_*.py`, `scripts/_triage_*.py`, `scripts/_scope_*.py`, `scripts/resume_conditions.py`, `scripts/issue_ingest.py`) and fails loud when any of them invoke `gh` directly instead of going through `scm.call(source, verb, args)`. Three-state exit (0 clean / 1 violations / 2 config error). Document an exception via `--allow-list <path>` (file with newline-separated glob patterns)."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    # Per `conventions/task-caching.md` (#574): NO `sources:` / `generates:`
+    # because the gate forwards user-facing flags via {{.CLI_ARGS}}
+    # (`--allow-list <path>` / `--quiet`) that go-task's incremental-build
+    # cache would silently swallow.
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/verify_scm_boundary.py" --project-root "{{.USER_WORKING_DIR}}" {{.CLI_ARGS}}
+
+  story-ready:
+    desc: "Deterministic story-start Gate 0 (#1378 Story C). Inspects working-tree cleanliness, the target vBRIEF lifecycle (active/ + plan.status==running), and the dispatch envelope's `## Allocation context` consent token (Story A schema). Three-state exit (0 ready / 1 not ready / 2 config error). -- task verify:story-ready -- --vbrief-path <active-story-path> [--allocation-context <dispatch-envelope-file>] [--allow-dirty] [--json]"
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    # Per `conventions/task-caching.md` (#574): NO `sources:` / `generates:`
+    # because the gate forwards user-facing flags via {{.CLI_ARGS}}
+    # (--vbrief-path / --allocation-context / --allow-dirty / --json) that
+    # go-task's incremental-build cache would silently swallow. Intentionally
+    # NOT wired into the `task check` aggregate: Gate 0 is a pre-`start_agent`
+    # dispatch gate that requires a concrete --vbrief-path, which a generic
+    # `task check` run has no way to supply.
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/preflight_story_start.py" --project-root "{{.USER_WORKING_DIR}}" {{.CLI_ARGS}}
+
+  investigation:
+    desc: "Validate a forensic investigation ledger (#1621). Promotes the forensic-research validator into a deterministic gate: the close check before Wave 5 / any causal chat. Three-state exit (0 close-ready / 1 hard failures / 2 config error). Intentionally NOT in the `task check` aggregate -- it requires a concrete --ledger path. -- task verify:investigation -- --ledger .tmp/investigations/<id>/investigation.vbrief.json [--json]"
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    # Per `conventions/task-caching.md` (#574): NO `sources:` / `generates:`
+    # because the gate forwards user-facing flags via {{.CLI_ARGS}}
+    # (--ledger / --json) that go-task's incremental-build cache would
+    # silently swallow.
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/verify_investigation.py" --project-root "{{.USER_WORKING_DIR}}" {{.CLI_ARGS}}
+
+  architecture-sor:
+    desc: "Diff-time system-of-record architecture gate. Scans stateful persistence signals and requires a matching architecture.systemOfRecord record. Example: task verify:architecture-sor -- --base-ref origin/main [--story-path <path>]"
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    # Per conventions/task-caching.md: no sources/generates because this gate
+    # forwards --base-ref, --story-path, and --json through CLI_ARGS.
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/preflight_architecture_sor.py" --project-root "{{.USER_WORKING_DIR}}" {{.CLI_ARGS}}
+
+  capacity:
+    desc: "Three-state ADVISORY capacity gate (#1419 Slice 4). Reports trailing-window target-vs-actual bucket mix from plan.policy.capacityAllocation; exits 0 in the default advise posture (and on insufficient sample / unconfigured policy), 1 only under an explicit enforce posture with a sampled deficit, 2 on config error. DELIBERATELY NOT in the `task check` aggregate -- capacity must never fail-closed on the framework tree."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    # Per `conventions/task-caching.md` (#574): NO `sources:` / `generates:`
+    # because the gate forwards user-facing flags via {{.CLI_ARGS}}
+    # (--project-root / --quiet) that go-task's incremental-build cache would
+    # silently swallow. Advisory-only: this target is intentionally absent
+    # from the `task check` deps so a capacity deficit cannot wedge the
+    # framework's own self-check (advise-mode discipline, #1419).
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/verify_capacity.py" --project-root "{{.USER_WORKING_DIR}}" {{.CLI_ARGS}}
+
+  judgment-gates:
+    desc: "Three-state ADVISORY judgment-gate engine (#1419 Slice 3). Evaluates a candidate change (diff paths / labels / body) against plan.policy.judgmentGates + four default-on universal safety gates (secrets / infra / AGENTS.md+skills / installer). Advisory by default (always exits 0); opt-in --enforce fails closed (exit 1) when a mechanical block-tier gate fires without a recorded clearance; exit 2 on config error. -- task verify:judgment-gates [-- --base-ref <ref>] [--path P] [--label L] [--enforce] [--json]. DELIBERATELY NOT in the `task check` aggregate -- judgment gates must never fail-closed on the framework tree (advise -> observe -> block rollout, #1419)."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    # Per `conventions/task-caching.md` (#574): NO `sources:` / `generates:`
+    # because the gate forwards user-facing flags via {{.CLI_ARGS}}
+    # (--base-ref / --path / --label / --body / --state / --enforce / --json /
+    # --quiet) that go-task's incremental-build cache would silently swallow.
+    # Advisory-only: this target is intentionally absent from the `task check`
+    # deps so a gate finding cannot wedge the framework's own self-check. The
+    # directive-side invocation never passes --enforce, so the gate stays
+    # advisory on the framework's own tree (advise-mode discipline, #1419).
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/verify_judgment_gates.py" --project-root "{{.USER_WORKING_DIR}}" {{.CLI_ARGS}}
+
+  wip-cap:
+    desc: "Pre-merge re-validation that pending/+active/ count is within plan.policy.wipCap (#1124 / D4 of #1119). Catches stale-branch merges + --force overrides. Default cap is 10 per umbrella #1119 Current Shape v3. The framework's own task check passes --allow-over-cap during landing-day overage; consumer projects MUST NOT pass that flag."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    # Per `conventions/task-caching.md` (#574): NO `sources:` /
+    # `generates:` because the gate forwards user-facing flags via
+    # {{.CLI_ARGS}} (--allow-over-cap / --quiet) that go-task's
+    # incremental-build cache would silently swallow. The framework's
+    # own `task check` invocation in Taskfile.yml passes
+    # `--allow-over-cap` so deft's landing-day overage (pending/+active/
+    # >> 10; resolved via D1 scope:demote --batch per umbrella v3) does
+    # not break framework self-check; consumer projects leave the flag
+    # OFF so a stale-branch / --force-merge over-cap state fails their
+    # `task check` loudly.
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/preflight_wip_cap.py" --project-root "{{.USER_WORKING_DIR}}" {{.CLI_ARGS}}

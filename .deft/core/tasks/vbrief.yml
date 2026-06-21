@@ -1,0 +1,199 @@
+version: '3'
+
+vars:
+  DEFT_ROOT: '{{joinPath .TASKFILE_DIR ".."}}'
+
+tasks:
+  validate:
+    desc: Validate vBRIEF lifecycle folder structure and cross-file consistency
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/vbrief_validate.py" --vbrief-dir "{{.USER_WORKING_DIR}}/vbrief"
+
+  preflight:
+    # Implementation-intent preflight wrapper (#810 / PR #812 fixup;
+    # #1046 PR-C / #1047 fail-closed resolver). Skill files
+    # (skills/deft-directive-build/SKILL.md Step 0,
+    # skills/deft-directive-swarm/SKILL.md Phase 0 Step 1) and the
+    # AGENTS.md template (templates/agents-entry.md Implementation Intent
+    # Gate block) reference THIS task rather than the underlying Python
+    # script directly so the skills are path-prefix-agnostic across the
+    # three supported install layouts:
+    #
+    #   1. ``.deft/core/scripts/...`` (v0.27+ canonical install per #992)
+    #   2. ``deft/scripts/...``       (legacy v0.20-v0.26 install)
+    #   3. ``scripts/...``            (in-repo case: deft framework itself)
+    #
+    # The wrapped ``preflight_implementation.py`` script is located
+    # via ``scripts/_resolve_preflight_path.py`` (#1046 PR-C / #1047),
+    # which probes the three candidate locations under
+    # ``{{.USER_WORKING_DIR}}`` in priority order and exits 2 with a
+    # structured ``gate misconfigured`` error pointing at
+    # ``task framework:doctor`` (#1046 PR-B / #1057) when no candidate
+    # resolves. The two-step invocation (resolve, then run) makes the
+    # fail-closed semantic explicit: if the resolver returns non-zero
+    # the inline ``sh:`` block exits with the same code BEFORE the
+    # downstream ``uv run python <script>`` ever fires, so the gate
+    # never silently fails open on a misconfigured install (the safety
+    # regression #1047 described).
+    #
+    # The resolver script ITSELF is dispatched via ``{{.DEFT_ROOT}}``
+    # (the Taskfile-relative install root) so it lives wherever the
+    # framework lives -- the resolver then probes the consumer's
+    # project root via ``{{.USER_WORKING_DIR}}``.
+    #
+    # The task bakes ``--vbrief-path`` so callers pass only the vBRIEF
+    # path: ``task vbrief:preflight -- <path>``.
+    #
+    # CLI_ARGS forwarding (#577): bare ``{{.CLI_ARGS}}`` -- DO NOT wrap
+    # in Taskfile-level double quotes. go-task already shell-escapes
+    # CLI_ARGS with single quotes, so wrapping in double quotes yields
+    # ``"'path'"`` at dispatch time on Windows (pwsh/cmd preserve nested
+    # quotes verbatim) and Python's argv receives a literal
+    # single-quote-prefixed filename that fails to open. This matches
+    # the convention enforced by tests/content/test_taskfile_cli_args.py
+    # and used in tasks/scope.yml / migrate.yml / prd.yml / etc.
+    # (Greptile P2 suggestion to quote was a false-positive against this
+    # project's established convention.)
+    #
+    # NOTE: NO ``sources:`` / ``generates:`` per ``conventions/task-caching.md``
+    # because the vBRIEF path is a user-facing argument forwarded via
+    # {{.CLI_ARGS}} and a cached cmds skip would silently swallow it.
+    desc: "Preflight an implementation-intent gate (#810): exits 0 only when vBRIEF is in vbrief/active/ AND plan.status == 'running'. Fails closed (#1046 PR-C / #1047) if the wrapped script cannot be resolved."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      # Two-step fail-closed invocation. Step 1 resolves the path; on
+      # non-zero exit (no candidate resolves) the ``||`` short-circuits
+      # and the whole ``sh:`` block exits with the resolver's code (2).
+      # Step 2 only fires when Step 1 produced a usable absolute path.
+      - |
+        resolved=$(uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/_resolve_preflight_path.py" --project-root "{{.USER_WORKING_DIR}}") || exit $?
+        uv --project "{{.DEFT_ROOT}}" run python "$resolved" --project-root "{{.USER_WORKING_DIR}}" --vbrief-path {{.CLI_ARGS}}
+
+  reconcile:graph:
+    # Cascade-unblock walker (#1287). Walks vbrief/proposed/, resolves each
+    # candidate's plan.metadata.swarm.depends_on[] against current lifecycle
+    # state, and promotes (proposed/ -> pending/ via scope_lifecycle) every
+    # candidate whose dependencies ALL resolve to a brief in completed/ or
+    # cancelled/. Pure-vBRIEF / forge-agnostic: reuses the swarm_readiness.py
+    # dep-graph + cycle machinery and the scope_lifecycle promote surface.
+    # WIP-cap aware, cycle-safe (exit 1 on a detected cycle), and idempotent
+    # (a second run is a no-op). Pass-through flags: --force (override the WIP
+    # cap, audited), --dry-run (report without moving), --json (machine
+    # summary).
+    #
+    # CLI_ARGS forwarding (#577): bare ``{{.CLI_ARGS}}`` -- DO NOT wrap in
+    # Taskfile-level double quotes. go-task already shell-escapes CLI_ARGS
+    # with single quotes; double-wrapping breaks Windows argv. See the
+    # preflight task below for the full rationale.
+    #
+    # NOTE: NO ``sources:`` / ``generates:`` per ``conventions/task-caching.md``
+    # because the walk reads/writes lifecycle folders that go-task does not
+    # track, so a cached skip would silently swallow real promotions.
+    desc: "Reconcile dep graph: promote proposed/ vBRIEFs whose swarm.depends_on[] all resolve to completed/ or cancelled/ (#1287). Flags: --force --dry-run --json."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/vbrief_reconcile_graph.py" --project-root "{{.USER_WORKING_DIR}}" {{.CLI_ARGS}}
+
+  reconcile:labels:
+    # SCM label reconciliation (#1288). Walks vbrief/proposed/ + pending/ +
+    # active/, resolves each brief's linked GitHub issue from its
+    # x-vbrief/github-issue reference, and applies/removes a fixed set of
+    # managed labels so the forge surface mirrors canonical vBRIEF state:
+    # status=blocked or an unresolved swarm.depends_on[] -> status:blocked;
+    # kind=epic -> epic + status:tracker; kind=research -> rfc. Mirror (not
+    # accumulate): managed labels that no longer apply are removed; labels
+    # outside the managed set are never touched. Every forge call routes
+    # through scripts/scm.py (#1145) so task verify:scm-boundary stays green,
+    # and the verb is idempotent (a second run mutates nothing). Pass-through
+    # flags: --repo OWNER/NAME (fallback when a reference URI lacks owner/
+    # repo), --dry-run (report without mutating), --json (machine summary).
+    #
+    # CLI_ARGS forwarding (#577): bare ``{{.CLI_ARGS}}`` -- DO NOT wrap in
+    # Taskfile-level double quotes. go-task already shell-escapes CLI_ARGS
+    # with single quotes; double-wrapping breaks Windows argv. See the
+    # preflight task above for the full rationale.
+    #
+    # NOTE: NO ``sources:`` / ``generates:`` per ``conventions/task-caching.md``
+    # because the walk reads the lifecycle folders and mutates remote forge
+    # state that go-task does not track, so a cached skip would silently
+    # swallow real label changes.
+    desc: "Reconcile SCM labels to mirror vBRIEF state: status:blocked / epic+status:tracker / rfc (#1288). Routes through scripts/scm.py. Flags: --repo --dry-run --json."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/vbrief_reconcile_labels.py" --project-root "{{.USER_WORKING_DIR}}" {{.CLI_ARGS}}
+
+  reconcile:umbrellas:
+    # Umbrella current-shape auto-update (#1289). Walks every kind=epic
+    # vBRIEF, resolves its children from its x-vbrief/plan references,
+    # computes the wave structure from the children's swarm.depends_on[]
+    # edges, builds the canonical AGENTS.md section-1152 current-shape body
+    # (Last updated / Last pass type / Child count / Child-count history /
+    # Open children / Closed children / Wave order / Open questions /
+    # Reading order), and edits the linked SCM umbrella's current-shape
+    # comment IN PLACE so the permalink is preserved and the amendment
+    # trail is never touched. When no current-shape comment exists yet, one
+    # is created at pass-1. Every forge call routes through scripts/scm.py
+    # (#1145) so task verify:scm-boundary stays green, and the verb is
+    # idempotent (a second run with unchanged epic state mutates nothing --
+    # the pass number is only bumped when the rendered body differs).
+    # Pass-through flags: --repo OWNER/NAME (fallback when a reference URI
+    # lacks owner/repo), --dry-run (report without mutating), --json
+    # (machine summary).
+    #
+    # CLI_ARGS forwarding (#577): bare ``{{.CLI_ARGS}}`` -- DO NOT wrap in
+    # Taskfile-level double quotes. go-task already shell-escapes CLI_ARGS
+    # with single quotes; double-wrapping breaks Windows argv. See the
+    # preflight task below for the full rationale.
+    #
+    # NOTE: NO ``sources:`` / ``generates:`` per ``conventions/task-caching.md``
+    # because the walk reads the lifecycle folders and mutates remote forge
+    # state that go-task does not track, so a cached skip would silently
+    # swallow real comment updates.
+    desc: "Reconcile epic umbrella current-shape comments to vBRIEF state per AGENTS.md #1152: edit in place (preserve permalink). Routes through scripts/scm.py. Flags: --repo --dry-run --json."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/vbrief_reconcile_umbrellas.py" --project-root "{{.USER_WORKING_DIR}}" {{.CLI_ARGS}}
+
+  activate:
+    # Implementation-intent activation gate companion (#810). Idempotent:
+    # already-active vBRIEFs print a no-op message and exit 0; pending/
+    # vBRIEFs flip plan.status pending|approved -> running, stamp
+    # vBRIEFInfo.updated to current ISO8601 UTC, and atomically move to
+    # vbrief/active/. Any other source folder is rejected with an
+    # actionable message. Pairs with `scripts/preflight_implementation.py`
+    # (also reachable via `task vbrief:preflight`): this task is the ONLY
+    # supported way to satisfy that gate.
+    #
+    # Dispatched via `{{.DEFT_ROOT}}/scripts/vbrief_activate.py` mirroring
+    # the `tasks/scope.yml` pattern (scope_lifecycle.py) so the JSON edit
+    # + atomic move logic is testable. The companion test lives at
+    # `tests/cli/test_vbrief_activate.py` to satisfy the forward-coverage
+    # rule from main.md.
+    #
+    # CLI_ARGS forwarding (#577): bare ``{{.CLI_ARGS}}`` -- DO NOT wrap
+    # in Taskfile-level double quotes. See the preflight task above for
+    # the full rationale; the short version is that go-task already
+    # shell-escapes CLI_ARGS with single quotes, and double-wrapping it
+    # breaks Windows argv. Spaces in paths survive correctly through
+    # bare interpolation.
+    #
+    # NOTE: NO ``sources:`` / ``generates:`` per ``conventions/task-caching.md``
+    # because the vBRIEF path is a user-facing argument forwarded via
+    # {{.CLI_ARGS}} and a cached cmds skip would silently swallow it.
+    desc: "Activate a vBRIEF: pending/ -> active/ (status: running). Idempotent. (#810)"
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.DEFT_ROOT}}" run python "{{.DEFT_ROOT}}/scripts/vbrief_activate.py" {{.CLI_ARGS}}

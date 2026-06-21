@@ -1,0 +1,77 @@
+{
+  "vBRIEFInfo": {
+    "version": "0.6",
+    "author": "agent:deft-directive-setup",
+    "description": "Veil project identity — Minimal Vector Skirmish",
+    "created": "2026-06-20T00:00:00Z"
+  },
+  "plan": {
+    "title": "Veil",
+    "status": "running",
+    "policy": {
+      "allowDirectCommitsToMaster": true
+    },
+    "narratives": {
+      "Overview": "Veil (Minimal Vector Skirmish) is a minimalist 2D top-down space combat arena built with Python and Pygame. Players pilot a vector-style ship against AI enemies, or watch fully autonomous AI-vs-AI battles. Target scope is a small, polished MVP prototype with high replayability via AI Arena mode.",
+      "TechStack": "Desktop app using Python 3 and Pygame only. Cross-platform (Windows, macOS, Linux). Windowed, resizable, 60 FPS target. Recommended module layout: main.py (entry/game loop), ship.py, ai.py, particle.py, utils.py.",
+      "Strategy": "Use interview for this project (Light path — single-session MVP).",
+      "Quality": "Run task check before commits. Target >=85% coverage on testable logic modules. Omit display-bound pygame event-loop entry (main.py) from coverage measurement per headless GUI constraints. Store secrets in secrets/ if needed. Tunable constants at top of source files.",
+      "ProjectRules": "Python 3 + Pygame only — no other external dependencies beyond a one-command pip install. Clean, commented, modular code. Monochrome vector aesthetic with subtle neon accents. MVP includes sound (pygame.mixer), local high-score persistence, wave power-ups, and alternate weapon types. Wave progression with late-wave obstacles. Deferred post-MVP: multiple arena sizes, mid-run hull customization.",
+      "Branching": "Trunk-based workflow — direct commits to master allowed (per USER.md override).",
+      "DeftVersion": "0.52.0"
+    },
+    "architecture": {
+      "codeStructure": {
+        "version": "0.1",
+        "modules": [
+          {
+            "id": "game-entry",
+            "name": "Game Entry",
+            "purpose": "Pygame initialization, main event loop, mode switching, and frame timing.",
+            "pathGlobs": ["main.py"],
+            "owner": "veil"
+          },
+          {
+            "id": "ship",
+            "name": "Ship",
+            "purpose": "Ship entity — polygon hull, physics state, rendering, weapons cooldown.",
+            "pathGlobs": ["ship.py"],
+            "owner": "veil"
+          },
+          {
+            "id": "ai",
+            "name": "AI Controller",
+            "purpose": "Modular AI behaviors attachable to any ship — chase, evade, personalities.",
+            "pathGlobs": ["ai.py"],
+            "owner": "veil"
+          },
+          {
+            "id": "particles",
+            "name": "Particle System",
+            "purpose": "Reusable particles for engine trails, hit sparks, and explosions.",
+            "pathGlobs": ["particle.py"],
+            "owner": "veil"
+          },
+          {
+            "id": "utils",
+            "name": "Utilities",
+            "purpose": "Vector math, drawing helpers, and shared constants.",
+            "pathGlobs": ["utils.py"],
+            "owner": "veil"
+          },
+          {
+            "id": "tests",
+            "name": "Tests",
+            "purpose": "Unit tests for physics, AI logic, collision, and game state (headless-safe modules).",
+            "pathGlobs": ["tests/**"],
+            "owner": "veil"
+          }
+        ],
+        "pathOwnership": [],
+        "allowedPatterns": [],
+        "projectionManifest": []
+      }
+    },
+    "items": []
+  }
+}

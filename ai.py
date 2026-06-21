@@ -1,0 +1,1280 @@
+"""AI ship controller."""
+
+from __future__ import annotations
+
+import math
+import random
+from dataclasses import dataclass
+from enum import Enum
+
+import config
+from combat import PowerUpKind, projectile_speed_for_variant, range_damage_multiplier
+from ship import Ship, ShipVariant
+from utils import (
+    Vec2,
+    segment_circle_intersect,
+    vec_add,
+    vec_from_angle,
+    vec_len,
+    vec_norm,
+    vec_scale,
+    vec_sub,
+    wrapped_delta,
+    wrapped_distance,
+)
+
+
+class Personality(str, Enum):
+    AGGRESSIVE = "aggressive"
+    DEFENSIVE = "defensive"
+    FLANKER = "flanker"
+
+
+PERSONALITY_FOR_VARIANT = {
+    ShipVariant.LIGHT: Personality.AGGRESSIVE,
+    ShipVariant.BALANCED: Personality.AGGRESSIVE,
+    ShipVariant.HEAVY: Personality.DEFENSIVE,
+}
+
+VARIANT_TIER = {
+    ShipVariant.LIGHT: 0,
+    ShipVariant.BALANCED: 1,
+    ShipVariant.HEAVY: 2,
+}
+
+
+@dataclass
+class AIDecisionContext:
+    """Snapshot of AI reasoning for one tick — used by telemetry."""
+
+    mode: str = "wander"
+    target_id: int | None = None
+    target_dist: float = 0.0
+    caution: float = 0.0
+    behind_target: bool = False
+    tail_gunner: bool = False
+    panicking: bool = False
+    kiting: bool = False
+    shield_ramming: bool = False
+    seeking_powerup: bool = False
+    breaking_orbit: bool = False
+    engage_quality: float = 0.0
+    rotate: float = 0.0
+    thrust: float = 0.0
+    fired: bool = False
+
+
+class AIController:
+    def __init__(self, personality: Personality | None = None) -> None:
+        self.personality = personality or random.choice(list(Personality))
+        self.wander_timer = 0.0
+        self.stuck_timer = 0.0
+        self.flank_sign = random.choice([-1.0, 1.0])
+        self.chase_stale_timer = 0.0
+        self.lead_stale_timer = 0.0
+        self.orbit_stale_timer = 0.0
+        self.orbit_break_timer = 0.0
+        self.break_orbit_sign = random.choice([-1.0, 1.0])
+        self.jitter_timer = 0.0
+        self.kite_burst_timer = 0.0
+        self.panic_burst_timer = 0.0
+        self.last_dist = 0.0
+        self.locked_target_id: int | None = None
+        self.last_context = AIDecisionContext()
+
+    @classmethod
+    def for_ship(cls, ship: Ship) -> AIController:
+        ctrl = cls(PERSONALITY_FOR_VARIANT.get(ship.variant))
+        ctrl.break_orbit_sign = 1.0 if ship.ship_id % 2 == 0 else -1.0
+        return ctrl
+
+    def _path_near_ships(
+        self,
+        start: Vec2,
+        end: Vec2,
+        ships: list[Ship],
+        clearance: float = 72.0,
+    ) -> bool:
+        steps = 6
+        for other in ships:
+            for i in range(1, steps + 1):
+                t = i / steps
+                sample = (
+                    start[0] + (end[0] - start[0]) * t,
+                    start[1] + (end[1] - start[1]) * t,
+                )
+                if (
+                    vec_len(vec_sub(sample, other.position))
+                    < other.radius + clearance
+                ):
+                    return True
+        return False
+
+    def _powerup_field_risk(
+        self,
+        ship: Ship,
+        pu,
+        others: list[Ship],
+        arena_rect: tuple[float, float, float, float] | None,
+    ) -> float:
+        opponents = self._living_opponents(ship, others)
+        if not opponents:
+            return 0.0
+
+        risk = 0.0
+        if len(opponents) >= 2:
+            risk += 0.20
+        if len(opponents) >= 3:
+            risk += 0.14
+
+        for other in opponents:
+            if arena_rect is not None:
+                to_pickup = wrapped_distance(
+                    other.position, pu.position, arena_rect
+                )
+                to_ship = wrapped_distance(
+                    ship.position, other.position, arena_rect
+                )
+            else:
+                to_pickup = vec_len(vec_sub(pu.position, other.position))
+                to_ship = vec_len(vec_sub(other.position, ship.position))
+            if to_pickup < 110:
+                risk += 0.30
+            elif to_pickup < 190:
+                risk += 0.14
+            if to_ship < 140:
+                risk += 0.20
+            elif to_ship < 220:
+                risk += 0.10
+
+        if self._path_near_ships(ship.position, pu.position, opponents):
+            risk += 0.24
+
+        return min(1.0, risk)
+
+    def _best_powerup_target(
+        self,
+        ship: Ship,
+        powerups: list,
+        threat_dist: float,
+        caution: float,
+        obstacles: list,
+        others: list[Ship] | None = None,
+        arena_rect: tuple[float, float, float, float] | None = None,
+    ) -> tuple | None:
+        best: tuple | None = None
+        best_score = 0.0
+        for pu in powerups:
+            if not pu.alive:
+                continue
+            pu_dist = vec_len(vec_sub(pu.position, ship.position))
+            score = self._powerup_seek_score(
+                ship, pu, pu_dist, threat_dist, caution, obstacles
+            )
+            if others:
+                field_risk = self._powerup_field_risk(
+                    ship, pu, others, arena_rect
+                )
+                score = max(0.0, score - field_risk * config.AI_POWERUP_RISK_PENALTY)
+            if score > best_score:
+                best_score = score
+                best = (pu, pu_dist, score)
+        return best
+
+    def _powerup_seek_score(
+        self,
+        ship: Ship,
+        pu,
+        pu_dist: float,
+        threat_dist: float,
+        caution: float,
+        obstacles: list,
+    ) -> float:
+        if pu_dist > 380:
+            return 0.0
+        score = max(0.0, 1.0 - pu_dist / 380.0) * 0.45
+
+        if threat_dist > 320:
+            score += 0.42
+        elif threat_dist > 230:
+            score += 0.26
+        elif threat_dist > 170:
+            score += 0.1
+        elif threat_dist < 130:
+            score -= 0.38
+
+        if pu_dist < 120 and threat_dist > 170:
+            score += 0.34
+        if pu_dist < 70 and threat_dist > 140:
+            score += 0.22
+
+        hurt = ship.health < ship.max_health * 0.55
+        if caution > 0.55 and pu_dist > 100 and not (hurt and pu.kind == PowerUpKind.SHIELD):
+            score -= 0.18
+        elif caution < 0.3:
+            score += 0.08
+
+        if pu.kind == PowerUpKind.SHIELD and ship.shield_timer < 1.5:
+            score += 0.32
+        if ship.champion_wins >= 2 and pu.kind == PowerUpKind.SHIELD:
+            score += 0.28
+        elif pu.kind == PowerUpKind.FIRE_RATE:
+            score += 0.16
+        elif pu.kind == PowerUpKind.SPREAD:
+            score += 0.2
+
+        if hurt and pu.kind == PowerUpKind.SHIELD:
+            score += 0.22
+            if pu_dist < 200:
+                score += 0.35
+            if pu_dist < 90:
+                score += 0.3
+
+        if self._path_blocked(ship.position, pu.position, obstacles, clearance=10):
+            score -= 0.22
+        else:
+            score += 0.12
+
+        return max(0.0, score)
+
+    def _arena_center(
+        self, arena_rect: tuple[float, float, float, float]
+    ) -> Vec2:
+        x, y, w, h = arena_rect
+        return (x + w * 0.5, y + h * 0.5)
+
+    def _edge_proximity(
+        self, pos: Vec2, arena_rect: tuple[float, float, float, float]
+    ) -> float:
+        """0 in the inner band, 1 hugging the arena wall."""
+        x, y, w, h = arena_rect
+        margin = min(w, h) * config.AI_ARENA_EDGE_MARGIN_FRAC
+        nearest = min(pos[0] - x, x + w - pos[0], pos[1] - y, y + h - pos[1])
+        if nearest >= margin:
+            return 0.0
+        return 1.0 - nearest / margin
+
+    def _bias_aim_toward_center(
+        self,
+        ship: Ship,
+        aim_pos: Vec2,
+        arena_rect: tuple[float, float, float, float] | None,
+    ) -> Vec2:
+        if arena_rect is None:
+            return aim_pos
+        edge = self._edge_proximity(ship.position, arena_rect)
+        if edge <= 0.02:
+            return aim_pos
+        center = self._arena_center(arena_rect)
+        bias = edge * config.AI_ARENA_CENTER_BIAS_MAX
+        return (
+            aim_pos[0] * (1.0 - bias) + center[0] * bias,
+            aim_pos[1] * (1.0 - bias) + center[1] * bias,
+        )
+
+    def _steer_from_aim(self, ship: Ship, aim_pos: Vec2) -> tuple[float, float, float]:
+        dx = aim_pos[0] - ship.position[0]
+        dy = aim_pos[1] - ship.position[1]
+        desired = math.atan2(dy, dx)
+        angle_diff = self._angle_diff(ship.angle, desired)
+        rotate_dir = 0.0
+        if angle_diff > 0.15:
+            rotate_dir = 1.0
+        elif angle_diff < -0.15:
+            rotate_dir = -1.0
+        return angle_diff, rotate_dir, desired
+
+    def _target_delta(
+        self,
+        ship: Ship,
+        target: Ship,
+        arena_rect: tuple[float, float, float, float] | None,
+    ) -> Vec2:
+        if arena_rect is None:
+            return vec_sub(target.position, ship.position)
+        raw = vec_sub(target.position, ship.position)
+        wrapped = wrapped_delta(ship.position, target.position, arena_rect)
+        edge = self._edge_proximity(ship.position, arena_rect)
+        target_edge = self._edge_proximity(target.position, arena_rect)
+        if (
+            (edge > config.AI_ARENA_WRAP_CHASE_EDGE or target_edge > config.AI_ARENA_WRAP_CHASE_EDGE)
+            and vec_len(wrapped) < vec_len(raw) * 0.82
+        ):
+            return raw
+        return wrapped
+
+    def nearest_threat(
+        self,
+        ship: Ship,
+        others: list[Ship],
+        arena_rect: tuple[float, float, float, float] | None = None,
+    ) -> Ship | None:
+        best: Ship | None = None
+        best_dist = float("inf")
+        for other in others:
+            if other is ship or not other.alive:
+                continue
+            if arena_rect is not None:
+                dist = wrapped_distance(ship.position, other.position, arena_rect)
+            else:
+                dist = vec_len(vec_sub(other.position, ship.position))
+            if dist < best_dist:
+                best_dist = dist
+                best = other
+        return best
+
+    def _living_opponents(self, ship: Ship, others: list[Ship]) -> list[Ship]:
+        return [o for o in others if o.alive and o.ship_id != ship.ship_id]
+
+    def _score_combat_target(
+        self,
+        ship: Ship,
+        other: Ship,
+        arena_rect: tuple[float, float, float, float] | None,
+        obstacles: list,
+    ) -> float:
+        rel = self._target_delta(ship, other, arena_rect)
+        dist = vec_len(rel)
+        if dist > config.AI_TARGET_MAX_DIST:
+            return 0.0
+
+        score = max(0.0, 1.0 - dist / config.AI_TARGET_MAX_DIST) * 0.30
+
+        to_other = math.atan2(rel[1], rel[0])
+        bearing = abs(self._angle_diff(ship.angle, to_other))
+        if bearing < 0.25:
+            score += 0.44
+        elif bearing < 0.55:
+            score += 0.30
+        elif bearing < 0.95:
+            score += 0.12
+        else:
+            score -= 0.10
+
+        if self._in_weapon_sweet_spot(ship, dist):
+            score += 0.24
+
+        lead = self.lead_target(ship, other, arena_rect)
+        lead_rel = vec_sub(lead, ship.position)
+        lead_bearing = abs(
+            self._angle_diff(ship.angle, math.atan2(lead_rel[1], lead_rel[0]))
+        )
+        if lead_bearing < 0.32:
+            score += 0.16
+
+        health_ratio = other.health / other.max_health
+        if health_ratio < 0.30:
+            score += 0.22
+        elif health_ratio < 0.50:
+            score += 0.10
+
+        if not self._path_blocked(ship.position, other.position, obstacles, clearance=12.0):
+            score += 0.08
+
+        return max(0.0, score)
+
+    def _select_combat_target(
+        self,
+        ship: Ship,
+        others: list[Ship],
+        obstacles: list,
+        arena_rect: tuple[float, float, float, float] | None = None,
+    ) -> Ship | None:
+        best: Ship | None = None
+        best_score = -1.0
+        for other in self._living_opponents(ship, others):
+            score = self._score_combat_target(ship, other, arena_rect, obstacles)
+            if score > best_score:
+                best_score = score
+                best = other
+        if best is None:
+            self.locked_target_id = None
+            return None
+
+        if self.locked_target_id is not None:
+            locked = next(
+                (
+                    o
+                    for o in self._living_opponents(ship, others)
+                    if o.ship_id == self.locked_target_id
+                ),
+                None,
+            )
+            if locked is not None:
+                locked_score = self._score_combat_target(
+                    ship, locked, arena_rect, obstacles
+                )
+                if locked_score >= best_score - config.AI_TARGET_SWITCH_MARGIN:
+                    return locked
+
+        self.locked_target_id = best.ship_id
+        return best
+
+    def _engagement_quality(
+        self,
+        ship: Ship,
+        target: Ship,
+        dist: float,
+        rel: Vec2,
+        obstacles: list,
+        arena_rect: tuple[float, float, float, float] | None = None,
+    ) -> float:
+        to_target = math.atan2(rel[1], rel[0])
+        bearing = abs(self._angle_diff(ship.angle, to_target))
+        quality = 0.0
+        if bearing < 0.28:
+            quality += 0.38
+        elif bearing < 0.58:
+            quality += 0.22
+        elif bearing < 0.95:
+            quality += 0.08
+
+        if self._in_weapon_sweet_spot(ship, dist):
+            quality += 0.30
+
+        ideal = self._ideal_weapon_range(ship)
+        band = config.AI_RANGE_INNER_TOLERANCE
+        if abs(dist - ideal) < band:
+            quality += 0.22
+        elif abs(dist - ideal) < band * 1.6:
+            quality += 0.10
+
+        if not self._path_blocked(ship.position, target.position, obstacles, clearance=12.0):
+            quality += 0.10
+
+        lead = self.lead_target(ship, target, arena_rect)
+        lead_rel = vec_sub(lead, ship.position)
+        lead_bearing = abs(
+            self._angle_diff(ship.angle, math.atan2(lead_rel[1], lead_rel[0]))
+        )
+        if lead_bearing < 0.35:
+            quality += 0.12
+
+        return min(1.0, quality)
+
+    def lead_target(
+        self,
+        shooter: Ship,
+        target: Ship,
+        arena_rect: tuple[float, float, float, float] | None = None,
+    ) -> Vec2:
+        rel = self._target_delta(shooter, target, arena_rect)
+        dist = vec_len(rel)
+        if dist < 1:
+            return target.position
+        bullet_time = dist / projectile_speed_for_variant(shooter.variant)
+        return vec_add(
+            shooter.position,
+            vec_add(rel, vec_scale(target.velocity, bullet_time)),
+        )
+
+    def _is_behind_target(self, ship: Ship, target: Ship, rel: Vec2) -> bool:
+        """True when ship sits in the target's rear arc (safe tail shot)."""
+        dist = vec_len(rel)
+        if dist > 420 or dist < 35:
+            return False
+        to_ship = math.atan2(-rel[1], -rel[0])
+        rear_gap = abs(self._angle_diff(target.angle, to_ship))
+        return rear_gap > 2.2
+
+    def _path_blocked(
+        self, start: Vec2, end: Vec2, obstacles: list, clearance: float = 8.0
+    ) -> bool:
+        steps = 8
+        for i in range(1, steps + 1):
+            t = i / steps
+            sample = (
+                start[0] + (end[0] - start[0]) * t,
+                start[1] + (end[1] - start[1]) * t,
+            )
+            for obs in obstacles:
+                if segment_circle_intersect(start, sample, obs.center, obs.collision_radius + clearance):
+                    return True
+        return False
+
+    def _flank_point(self, ship: Ship, target: Ship, obstacles: list) -> Vec2:
+        rel = vec_sub(target.position, ship.position)
+        dist = max(vec_len(rel), 1.0)
+        perp = (-rel[1] / dist * self.flank_sign, rel[0] / dist * self.flank_sign)
+        offset = 160.0
+        for _ in range(2):
+            candidate = (
+                target.position[0] + perp[0] * offset,
+                target.position[1] + perp[1] * offset,
+            )
+            if not self._path_blocked(ship.position, candidate, obstacles):
+                return candidate
+            self.flank_sign *= -1
+            perp = (-perp[1], perp[0])
+        return target.position
+
+    def _avoidance_vector(self, ship: Ship, obstacles: list) -> Vec2:
+        push = (0.0, 0.0)
+        for obs in obstacles:
+            dist = vec_len(vec_sub(ship.position, obs.center))
+            if dist > ship.radius + obs.collision_radius + 50:
+                continue
+            away = vec_sub(ship.position, obs.center)
+            dist = max(dist, 1.0)
+            weight = (ship.radius + obs.collision_radius + 50) / dist
+            push = (push[0] + away[0] / dist * weight, push[1] + away[1] / dist * weight)
+        return push
+
+    def _angle_diff(self, from_angle: float, to_angle: float) -> float:
+        return (to_angle - from_angle + math.pi) % (2 * math.pi) - math.pi
+
+    def _is_stale_tail_chase(self, ship: Ship, target: Ship, angle_diff: float, dist: float) -> bool:
+        """Pursuer stuck behind a circling leader."""
+        if dist < 55 or dist > 400:
+            return False
+        if abs(angle_diff) < 0.5:
+            return False
+        if vec_len(ship.velocity) < 50 or vec_len(target.velocity) < 50:
+            return False
+        rel = vec_sub(target.position, ship.position)
+        to_pursuer = math.atan2(ship.position[1] - target.position[1], ship.position[0] - target.position[0])
+        target_heading = (
+            math.atan2(target.velocity[1], target.velocity[0])
+            if vec_len(target.velocity) > 20
+            else target.angle
+        )
+        tail_align = abs(self._angle_diff(target_heading, to_pursuer))
+        return tail_align > 2.0
+
+    def _is_stale_lead_orbit(self, ship: Ship, target: Ship, dist: float) -> bool:
+        """Leader being tailed in a stable-distance circle."""
+        if dist > 380 or dist < 50:
+            return False
+        if vec_len(ship.velocity) < 60:
+            return False
+        rel = vec_sub(target.position, ship.position)
+        to_chaser = math.atan2(rel[1], rel[0])
+        behind = abs(self._angle_diff(ship.angle, to_chaser))
+        return behind > 2.0
+
+    def _radial_speed(self, ship: Ship, toward: Vec2) -> float:
+        dist = max(vec_len(toward), 1.0)
+        unit = (toward[0] / dist, toward[1] / dist)
+        return ship.velocity[0] * unit[0] + ship.velocity[1] * unit[1]
+
+    def _is_mutual_orbit(
+        self, ship: Ship, target: Ship, dist: float, dist_delta: float
+    ) -> bool:
+        """Two ships circling at stable range with little closing speed."""
+        if dist < 70 or dist > 340:
+            return False
+        if dist_delta > 18:
+            return False
+        if vec_len(ship.velocity) < 55 or vec_len(target.velocity) < 55:
+            return False
+        rel = vec_sub(target.position, ship.position)
+        to_target = math.atan2(rel[1], rel[0])
+        to_ship = math.atan2(-rel[1], -rel[0])
+        ship_side = abs(self._angle_diff(ship.angle, to_target))
+        target_side = abs(self._angle_diff(target.angle, to_ship))
+        if ship_side < 0.4 or ship_side > 2.4:
+            return False
+        if target_side < 0.4 or target_side > 2.4:
+            return False
+        if abs(self._radial_speed(ship, rel)) > 32:
+            return False
+        if abs(self._radial_speed(target, (-rel[0], -rel[1]))) > 32:
+            return False
+        return True
+
+    def _proximity_scale(self, dist: float) -> float:
+        """Caution only matters when the threat is actually nearby."""
+        if dist >= 360:
+            return 0.0
+        if dist <= 140:
+            return 1.0
+        return 1.0 - (dist - 140) / 220
+
+    def _retreat_urgency(
+        self, ship: Ship, target: Ship, dist: float, rel: Vec2
+    ) -> float:
+        """How cautious to be (0 = fight, 1 = panic flee)."""
+        health_ratio = ship.health / ship.max_health
+        tier_gap = VARIANT_TIER[target.variant] - VARIANT_TIER[ship.variant]
+        closing = self._radial_speed(ship, rel)
+        proximity = self._proximity_scale(dist)
+
+        health_urgency = 0.0
+        if health_ratio < 0.12:
+            health_urgency = 0.58
+        elif health_ratio < 0.22:
+            health_urgency = 0.4
+        elif health_ratio < 0.38:
+            health_urgency = 0.22
+
+        threat_urgency = 0.0
+        if ship.variant == ShipVariant.LIGHT and target.variant == ShipVariant.HEAVY:
+            if dist < 240:
+                threat_urgency = max(
+                    threat_urgency, 0.32 + (240 - dist) / 240 * 0.36
+                )
+            if dist < 140 and closing > 30:
+                threat_urgency = max(threat_urgency, 0.72)
+        elif ship.variant == ShipVariant.BALANCED and target.variant == ShipVariant.HEAVY:
+            if dist < 95:
+                threat_urgency = max(threat_urgency, 0.42)
+            elif dist < 155 and health_ratio < 0.28:
+                threat_urgency = max(threat_urgency, 0.36)
+        elif tier_gap > 0 and dist < 85:
+            threat_urgency = max(threat_urgency, 0.34)
+
+        if closing > 70 and dist < 130:
+            threat_urgency = max(
+                threat_urgency, 0.38 + min(closing, 110) / 200
+            )
+
+        urgency = min(1.0, health_urgency * proximity + threat_urgency * proximity)
+        if dist > 250:
+            urgency *= 0.55
+        elif dist > 180:
+            urgency *= 0.75
+        if self._is_behind_target(ship, target, rel) and health_ratio < 0.52:
+            urgency *= 0.18
+        return urgency
+
+    def _ideal_weapon_range(self, ship: Ship) -> float:
+        if ship.variant == ShipVariant.LIGHT:
+            return config.AI_IDEAL_RANGE_LIGHT
+        if ship.variant == ShipVariant.HEAVY:
+            return config.AI_IDEAL_RANGE_HEAVY
+        return config.AI_IDEAL_RANGE_BALANCED
+
+    def _in_weapon_sweet_spot(self, ship: Ship, dist: float) -> bool:
+        return range_damage_multiplier(ship.variant, dist) >= 1.02
+
+    def _blend_range_thrust(self, ship: Ship, dist: float, base: float) -> float:
+        """Nudge thrust toward each hull's preferred damage band."""
+        err = dist - self._ideal_weapon_range(ship)
+        inner = config.AI_RANGE_INNER_TOLERANCE
+        outer = config.AI_RANGE_OUTER_TOLERANCE
+        if ship.variant == ShipVariant.LIGHT:
+            if err > outer:
+                return max(base, 0.82)
+            if err > inner * 0.55:
+                return max(base, 0.58)
+            if err < -inner * 0.45:
+                return min(base, 0.38)
+            return max(base, 0.42)
+        if ship.variant == ShipVariant.HEAVY:
+            if err < -inner:
+                return min(base, -0.28)
+            if err < -inner * 0.45:
+                return min(base, 0.12)
+            if err > outer * 1.1:
+                return max(base, 0.38)
+            if err > inner * 0.5:
+                return min(base, 0.22)
+            return min(base, 0.35)
+        if err > outer:
+            return max(base, 0.58)
+        if err < -outer:
+            return min(base, max(0.0, base - 0.18))
+        if abs(err) < inner * 0.55:
+            return max(base, 0.4)
+        return base
+
+    def _kite_point(self, ship: Ship, target: Ship, dist: float, obstacles: list) -> Vec2:
+        """Circle at weapon-optimal range instead of reversing forever."""
+        rel = vec_sub(target.position, ship.position)
+        sep = max(vec_len(rel), 1.0)
+        to_target = (rel[0] / sep, rel[1] / sep)
+        perp = (-to_target[1] * self.flank_sign, to_target[0] * self.flank_sign)
+        ideal = self._ideal_weapon_range(ship)
+        inner = config.AI_RANGE_INNER_TOLERANCE
+        outer = config.AI_RANGE_OUTER_TOLERANCE
+        if dist < ideal - inner:
+            blend = -0.5 if ship.variant == ShipVariant.HEAVY else -0.2
+        elif dist > ideal + outer:
+            blend = 0.45 if ship.variant == ShipVariant.LIGHT else 0.28
+        else:
+            blend = 0.0
+        dir_x = to_target[0] * blend + perp[0] * 0.9
+        dir_y = to_target[1] * blend + perp[1] * 0.9
+        mag = max(vec_len((dir_x, dir_y)), 0.01)
+        scale = 180.0
+        candidate = (
+            ship.position[0] + dir_x / mag * scale,
+            ship.position[1] + dir_y / mag * scale,
+        )
+        if self._path_blocked(ship.position, candidate, obstacles):
+            candidate = (
+                ship.position[0] - dir_x / mag * scale,
+                ship.position[1] - dir_y / mag * scale,
+            )
+        return candidate
+
+    def _shield_ram_range(self, ship: Ship) -> float:
+        if ship.variant == ShipVariant.HEAVY:
+            return 280.0
+        if ship.variant == ShipVariant.BALANCED:
+            return 240.0
+        return 210.0
+
+    def _retreat_point(self, ship: Ship, target: Ship, obstacles: list) -> Vec2:
+        rel = vec_sub(ship.position, target.position)
+        dist = max(vec_len(rel), 1.0)
+        away = (rel[0] / dist, rel[1] / dist)
+        perp = (-away[1] * self.flank_sign, away[0] * self.flank_sign)
+        candidate = (
+            ship.position[0] + away[0] * 220 + perp[0] * 90,
+            ship.position[1] + away[1] * 220 + perp[1] * 90,
+        )
+        if self._path_blocked(ship.position, candidate, obstacles):
+            candidate = (
+                ship.position[0] + away[0] * 220 - perp[0] * 90,
+                ship.position[1] + away[1] * 220 - perp[1] * 90,
+            )
+        return candidate
+
+    def _injury_speed_control(
+        self,
+        ship: Ship,
+        thrust: float,
+        strafe: float,
+        threat_dist: float = 999.0,
+    ) -> tuple[float, float]:
+        """Hurt ships brake instead of maintaining panic speed."""
+        ratio = ship.health / ship.max_health
+        if ratio >= config.AI_INJURY_HEALTH_RATIO:
+            return thrust, strafe
+        speed = vec_len(ship.velocity)
+        if threat_dist > 320 and speed < 300:
+            return min(thrust, 0.42), strafe * 0.8
+        if speed > config.AI_INJURY_MAX_SPEED:
+            return -0.55, strafe * 0.35
+        if speed > config.AI_INJURY_BRAKE_SPEED:
+            return min(thrust, -0.3), strafe * 0.5
+        if speed > 140:
+            return min(thrust, 0.18), strafe * 0.65
+        return min(thrust, 0.38), strafe * 0.75
+
+    def _ram_avoid_thrust(self, ship: Ship, others: list[Ship]) -> float | None:
+        speed = vec_len(ship.velocity)
+        if speed < 120:
+            return None
+        for other in others:
+            if not other.alive or other.ship_id == ship.ship_id:
+                continue
+            rel = vec_sub(other.position, ship.position)
+            dist = vec_len(rel)
+            if dist > 130 or dist < 1:
+                continue
+            closing = self._radial_speed(ship, rel)
+            if closing > 60:
+                return -0.75
+        return None
+
+    def _orbit_break_aim(
+        self, ship: Ship, target: Ship, as_pursuer: bool
+    ) -> Vec2:
+        """Cut across the circle instead of following the tail."""
+        rel = vec_sub(target.position, ship.position)
+        dist = max(vec_len(rel), 1.0)
+        perp = (-rel[1] / dist, rel[0] / dist)
+        sign = self.break_orbit_sign * (-1 if as_pursuer else 1)
+        offset = 140.0 if as_pursuer else 110.0
+        return (
+            ship.position[0] + perp[0] * offset * sign,
+            ship.position[1] + perp[1] * offset * sign,
+        )
+
+    def update(
+        self,
+        ship: Ship,
+        others: list[Ship],
+        dt: float,
+        obstacles: list | None = None,
+        powerups: list | None = None,
+        arena_rect: tuple[float, float, float, float] | None = None,
+    ) -> tuple[float, float, bool]:
+        """Return rotate_dir (-1/0/1), thrust_dir, should_fire."""
+        obs = obstacles or []
+        pickups = powerups or []
+        target = self._select_combat_target(ship, others, obs, arena_rect)
+        if target is None:
+            self.wander_timer -= dt
+            if self.wander_timer <= 0:
+                self.wander_timer = random.uniform(0.5, 1.5)
+            rot = float(random.choice([-1, 0, 1]))
+            self.last_context = AIDecisionContext(mode="wander", rotate=rot)
+            return (rot, 0.0, False)
+
+        rel_to_target = self._target_delta(ship, target, arena_rect)
+        dist = vec_len(rel_to_target)
+        opponents = self._living_opponents(ship, others)
+        engage_quality = self._engagement_quality(
+            ship, target, dist, rel_to_target, obs, arena_rect
+        )
+        behind_target = self._is_behind_target(ship, target, rel_to_target)
+        closing = self._radial_speed(ship, rel_to_target)
+        caution = self._retreat_urgency(ship, target, dist, rel_to_target)
+        shield_ramming = (
+            ship.shield_timer > 0 and dist < self._shield_ram_range(ship)
+        )
+
+        panic_pull = caution >= 0.78 and not shield_ramming
+        panicking = panic_pull and dist < 210
+
+        pickup = self._best_powerup_target(
+            ship, pickups, dist, caution, obs, others, arena_rect
+        )
+        seeking_powerup = False
+        pickup_bias = 0.0
+        pickup_field_risk = 0.0
+        if pickup and not shield_ramming:
+            pu, pu_dist, pu_score = pickup
+            pickup_field_risk = self._powerup_field_risk(
+                ship, pu, others, arena_rect
+            )
+            hurt = ship.health < ship.max_health * 0.55
+            shield_grab = (
+                pu.kind == PowerUpKind.SHIELD
+                and pu_dist < 170
+                and hurt
+                and pu_score >= config.AI_POWERUP_EASY_REACH_SCORE
+            )
+            easy_reach = (
+                pu_dist < config.AI_POWERUP_EASY_REACH_DIST
+                and pu_score >= config.AI_POWERUP_EASY_REACH_SCORE
+                and not self._path_blocked(ship.position, pu.position, obs, clearance=10)
+            )
+            commit_pickup = (
+                pu_score >= config.AI_POWERUP_SEEK_SCORE
+                or easy_reach
+                or shield_grab
+            )
+            if pickup_field_risk >= config.AI_POWERUP_ABORT_RISK:
+                commit_pickup = bool(shield_grab)
+            elif pickup_field_risk >= config.AI_POWERUP_CAUTION_RISK:
+                commit_pickup = bool(shield_grab) or (
+                    easy_reach and pu_score >= 0.42
+                )
+            if commit_pickup:
+                seeking_powerup = True
+            elif pu_score >= 0.28 and not panicking:
+                pickup_bias = min(0.48, pu_score - 0.08)
+
+        tail_gunner = (
+            ship.health < ship.max_health * 0.52
+            and behind_target
+            and not seeking_powerup
+        )
+        if tail_gunner:
+            panicking = False
+            panic_pull = False
+        kiting = (
+            (caution >= 0.28 or (panic_pull and dist >= 210))
+            and not panicking
+            and not shield_ramming
+            and not tail_gunner
+            and not seeking_powerup
+        )
+
+        self.kite_burst_timer -= dt
+        self.panic_burst_timer -= dt
+        snap_shot = kiting and self.kite_burst_timer > 0
+        if kiting and self.kite_burst_timer <= 0 and random.random() < 0.022:
+            self.kite_burst_timer = random.uniform(0.45, 0.8)
+        panic_snap = panicking and self.panic_burst_timer > 0
+        if panicking and self.panic_burst_timer <= 0 and random.random() < 0.04:
+            self.panic_burst_timer = random.uniform(0.35, 0.7)
+        reengage = (
+            ship.health < ship.max_health * 0.42
+            and dist > 300
+            and caution < 0.2
+        )
+        solo_dogfight = (
+            len(opponents) == 1
+            and ship.health >= ship.max_health * 0.35
+            and 55 < dist < config.AI_SOLO_DOGFIGHT_MAX_DIST
+            and not panicking
+            and not shield_ramming
+            and not seeking_powerup
+            and not tail_gunner
+        )
+
+        if shield_ramming:
+            aim_pos = (
+                vec_add(ship.position, rel_to_target)
+                if dist < 130
+                else self.lead_target(ship, target, arena_rect)
+            )
+        elif tail_gunner:
+            aim_pos = self.lead_target(ship, target, arena_rect)
+        elif seeking_powerup and pickup:
+            aim_pos = pickup[0].position
+        elif reengage or (kiting and dist > 320):
+            aim_pos = self.lead_target(ship, target, arena_rect)
+        elif panicking:
+            if behind_target or panic_snap:
+                aim_pos = self.lead_target(ship, target, arena_rect)
+            elif dist > 115:
+                aim_pos = self._kite_point(ship, target, dist, obs)
+            else:
+                aim_pos = self._retreat_point(ship, target, obs)
+        elif snap_shot:
+            aim_pos = self.lead_target(ship, target, arena_rect)
+        elif kiting:
+            aim_pos = self._kite_point(ship, target, dist, obs)
+        else:
+            aim_pos = self.lead_target(ship, target, arena_rect)
+        if pickup_bias > 0 and pickup and not seeking_powerup:
+            pu_pos = pickup[0].position
+            aim_pos = (
+                aim_pos[0] * (1.0 - pickup_bias) + pu_pos[0] * pickup_bias,
+                aim_pos[1] * (1.0 - pickup_bias) + pu_pos[1] * pickup_bias,
+            )
+        blocked = self._path_blocked(ship.position, aim_pos, obs)
+        if blocked and not panicking and not kiting and not shield_ramming and not seeking_powerup:
+            aim_pos = self._flank_point(ship, target, obs)
+
+        avoid = self._avoidance_vector(ship, obs)
+        if vec_len(avoid) > 0.2 and not shield_ramming:
+            scale = 110 if panicking else 90
+            aim_pos = (
+                aim_pos[0] + avoid[0] * scale,
+                aim_pos[1] + avoid[1] * scale,
+            )
+
+        aim_pos = self._bias_aim_toward_center(ship, aim_pos, arena_rect)
+        angle_diff, rotate_dir, _ = self._steer_from_aim(ship, aim_pos)
+        turn_gate = 0.08 if shield_ramming else 0.15
+        if abs(angle_diff) <= turn_gate:
+            rotate_dir = 0.0
+
+        thrust = 0.0
+        strafe = 0.0
+        breaking_orbit = False
+        orbit_force_shot = False
+
+        fire_cone = 0.7
+        fire_range = 750.0
+        if ship.variant == ShipVariant.LIGHT:
+            fire_cone = 0.82
+            fire_range = 820.0
+        has_los = not self._path_blocked(ship.position, target.position, obs, clearance=12.0)
+
+        stale_tail = self._is_stale_tail_chase(ship, target, angle_diff, dist)
+        stale_lead = self._is_stale_lead_orbit(ship, target, dist)
+        stale_mutual = self._is_mutual_orbit(ship, target, dist, abs(dist - self.last_dist))
+        dist_delta = abs(dist - self.last_dist)
+        self.last_dist = dist
+
+        if stale_tail and dist_delta < 25:
+            self.chase_stale_timer += dt
+        else:
+            self.chase_stale_timer = max(0.0, self.chase_stale_timer - dt * 0.5)
+
+        if stale_lead and dist_delta < 30:
+            self.lead_stale_timer += dt
+        else:
+            self.lead_stale_timer = max(0.0, self.lead_stale_timer - dt * 0.5)
+
+        if stale_mutual and dist_delta < 20:
+            self.orbit_stale_timer += dt
+        else:
+            self.orbit_stale_timer = max(0.0, self.orbit_stale_timer - dt * 0.8)
+
+        break_chase = self.chase_stale_timer > config.ORBIT_BREAK_CHASE_TIMER
+        break_lead = self.lead_stale_timer > config.ORBIT_BREAK_LEAD_TIMER
+        break_mutual = self.orbit_stale_timer > config.ORBIT_BREAK_MUTUAL_TIMER
+        to_target = math.atan2(rel_to_target[1], rel_to_target[0])
+        target_bearing = abs(self._angle_diff(ship.angle, to_target))
+        if (
+            (break_chase or break_lead or break_mutual)
+            and not panicking
+            and not shield_ramming
+            and not seeking_powerup
+            and not tail_gunner
+        ):
+            breaking_orbit = True
+            self.orbit_break_timer += dt
+            force_start = config.ORBIT_BREAK_FORCE_SHOT_TIMER
+            force_end = force_start + config.ORBIT_BREAK_FORCE_SHOT_WINDOW
+            orbit_force_shot = force_start <= self.orbit_break_timer < force_end
+            as_pursuer = break_chase and self.chase_stale_timer >= self.lead_stale_timer
+            shoot_first = has_los and dist < fire_range
+            if orbit_force_shot or shoot_first:
+                aim_pos = self.lead_target(ship, target, arena_rect)
+            else:
+                aim_pos = self._orbit_break_aim(ship, target, as_pursuer=as_pursuer)
+            dx = aim_pos[0] - ship.position[0]
+            dy = aim_pos[1] - ship.position[1]
+            desired = math.atan2(dy, dx)
+            angle_diff = self._angle_diff(ship.angle, desired)
+            gate = config.ORBIT_BREAK_AIM_GATE
+            rotate_dir = 1.0 if angle_diff > gate else (-1.0 if angle_diff < -gate else 0.0)
+            if orbit_force_shot:
+                thrust = 0.78 if dist > fire_range else 0.24
+                strafe = self.flank_sign * 0.08
+            elif shoot_first:
+                thrust = 0.32 if dist > 140 else 0.16
+                strafe = self.flank_sign * 0.22
+            elif break_mutual and not break_chase and not break_lead:
+                thrust = -0.5 if ship.ship_id % 2 == 0 else 1.0
+                strafe = self.break_orbit_sign * 1.6
+            else:
+                thrust = 0.25 if as_pursuer else -0.35
+                strafe = self.break_orbit_sign * 1.4
+            if (
+                self.chase_stale_timer > config.ORBIT_BREAK_MAX_DURATION + 0.7
+                or self.lead_stale_timer > config.ORBIT_BREAK_MAX_DURATION + 0.8
+                or self.orbit_stale_timer > config.ORBIT_BREAK_MAX_DURATION
+                or self.orbit_break_timer >= force_end
+            ):
+                self.chase_stale_timer = 0.0
+                self.lead_stale_timer = 0.0
+                self.orbit_stale_timer = 0.0
+                self.orbit_break_timer = 0.0
+                self.break_orbit_sign *= -1
+        else:
+            self.orbit_break_timer = max(0.0, self.orbit_break_timer - dt * 2.0)
+
+        self.jitter_timer -= dt
+        orbit_shoot_first = breaking_orbit and (
+            orbit_force_shot or (has_los and dist < fire_range)
+        )
+        if breaking_orbit and not orbit_shoot_first and self.jitter_timer <= 0:
+            jitter = vec_from_angle(
+                ship.angle + self.break_orbit_sign * 1.57,
+                random.uniform(40, 90),
+            )
+            aim_pos = (aim_pos[0] + jitter[0], aim_pos[1] + jitter[1])
+            self.jitter_timer = random.uniform(0.25, 0.55)
+
+        aim_pos = self._bias_aim_toward_center(ship, aim_pos, arena_rect)
+        angle_diff, rotate_dir, _ = self._steer_from_aim(ship, aim_pos)
+        turn_gate = 0.08 if shield_ramming else 0.15
+        if abs(angle_diff) <= turn_gate:
+            rotate_dir = 0.0
+
+        if shield_ramming:
+            thrust = 1.0
+            if abs(angle_diff) > 0.55:
+                strafe = self.flank_sign * 0.7
+        elif seeking_powerup and pickup:
+            pu_dist = pickup[1]
+            if pickup_field_risk >= config.AI_POWERUP_CAUTION_RISK:
+                thrust = 0.24 if pu_dist > 70 else 0.14
+            elif pu_dist > 120:
+                thrust = 0.52
+            elif pu_dist > 55:
+                thrust = 0.34
+            else:
+                thrust = 0.18
+            strafe = self.flank_sign * (0.22 if pickup_field_risk >= config.AI_POWERUP_CAUTION_RISK else 0.32)
+        elif pickup_bias > 0:
+            thrust = 0.62
+            strafe = self.flank_sign * 0.35
+        elif (
+            ship.variant == ShipVariant.LIGHT
+            and target.variant == ShipVariant.HEAVY
+            and ship.health < ship.max_health * 0.42
+            and dist < 175
+        ):
+            thrust = -0.52
+            strafe = self.flank_sign * 0.95
+        elif tail_gunner:
+            thrust = 0.42 if dist > 180 else 0.22
+            strafe = self.flank_sign * 0.35
+        elif reengage or (kiting and dist > 320):
+            thrust = 0.7 if dist > 400 else 0.5
+            strafe = self.flank_sign * 0.6
+        elif panicking:
+            hurt_panic = ship.health < ship.max_health * config.AI_INJURY_HEALTH_RATIO
+            if dist > 115:
+                thrust = 0.22 if hurt_panic else (0.4 if closing > 40 else 0.32)
+                strafe = self.flank_sign * (0.45 if hurt_panic else 0.95)
+            else:
+                thrust = 0.18 if hurt_panic else (0.48 if closing > 35 else 0.28)
+                strafe = self.flank_sign * (0.4 if hurt_panic else (0.75 + caution * 0.35))
+        elif kiting:
+            ideal = self._ideal_weapon_range(ship)
+            if snap_shot:
+                thrust = 0.25
+            elif dist > ideal + config.AI_RANGE_OUTER_TOLERANCE:
+                thrust = 0.62 if ship.variant == ShipVariant.LIGHT else 0.48
+            elif dist < ideal - config.AI_RANGE_INNER_TOLERANCE and closing > 25:
+                thrust = -0.18 if ship.variant == ShipVariant.HEAVY else -0.08
+            else:
+                thrust = 0.38
+            thrust = self._blend_range_thrust(ship, dist, thrust)
+            strafe = self.flank_sign * 1.0
+        elif not breaking_orbit:
+            health_ratio = ship.health / ship.max_health
+            if self.personality == Personality.AGGRESSIVE:
+                if ship.variant == ShipVariant.LIGHT and target.variant == ShipVariant.HEAVY:
+                    if health_ratio < 0.38 and dist < 160:
+                        thrust = -0.55
+                        strafe = self.flank_sign * 1.1
+                    elif dist > self._ideal_weapon_range(ship) + 80:
+                        thrust = 0.88
+                    elif dist < 110:
+                        thrust = 0.38
+                    else:
+                        thrust = 0.55
+                elif ship.variant == ShipVariant.HEAVY and target.variant == ShipVariant.LIGHT:
+                    if dist < self._ideal_weapon_range(ship) - 120:
+                        thrust = -0.32 if closing > 25 else -0.18
+                    elif dist > self._ideal_weapon_range(ship) + 60:
+                        thrust = 0.22
+                    else:
+                        thrust = 0.3
+                elif ship.variant == ShipVariant.LIGHT and dist < 70:
+                    thrust = 0.42
+                else:
+                    thrust = 0.68 if dist > 80 else 0.38
+                    if blocked:
+                        thrust = 0.62
+            elif self.personality == Personality.DEFENSIVE:
+                if ship.health < ship.max_health * 0.4 and not tail_gunner:
+                    thrust = -0.6
+                    strafe = 1.0 if random.random() > 0.5 else -1.0
+                else:
+                    thrust = 0.7 if blocked else 0.5
+            else:
+                thrust = 0.85
+                strafe = 1.0 if angle_diff > 0 else -1.0
+            if not tail_gunner and not shield_ramming:
+                thrust = self._blend_range_thrust(ship, dist, thrust)
+            if solo_dogfight and not breaking_orbit:
+                strafe = self.flank_sign * 0.82
+                ideal = self._ideal_weapon_range(ship)
+                in_band = abs(dist - ideal) < config.AI_RANGE_OUTER_TOLERANCE
+                if (
+                    engage_quality >= config.AI_ENGAGE_QUALITY_THRESHOLD
+                    and (self._in_weapon_sweet_spot(ship, dist) or in_band)
+                ):
+                    cap = (
+                        config.AI_ENGAGE_SNAP_THRUST
+                        if engage_quality >= 0.74
+                        else config.AI_ENGAGE_HOLD_THRUST
+                    )
+                    thrust = min(thrust, cap)
+
+        facing_target = target_bearing < 0.42
+
+        should_fire = has_los and facing_target and dist < fire_range
+        if tail_gunner:
+            should_fire = (
+                has_los
+                and dist < fire_range
+                and abs(self._angle_diff(ship.angle, to_target)) < 0.78
+            )
+        elif shield_ramming:
+            should_fire = (
+                has_los
+                and dist > 75
+                and dist < fire_range
+                and abs(self._angle_diff(ship.angle, to_target)) < 0.5
+            )
+        elif panicking:
+            if behind_target or panic_snap or dist > 115:
+                should_fire = (
+                    has_los
+                    and dist < fire_range
+                    and abs(self._angle_diff(ship.angle, to_target)) < 0.68
+                )
+            else:
+                should_fire = (
+                    has_los
+                    and dist < fire_range * 0.85
+                    and abs(self._angle_diff(ship.angle, to_target)) < 0.5
+                )
+        elif kiting:
+            cone = 0.58
+            if self._in_weapon_sweet_spot(ship, dist):
+                cone = 0.72
+            should_fire = should_fire and abs(self._angle_diff(ship.angle, to_target)) < cone
+        elif breaking_orbit:
+            in_force_range = has_los and dist < config.ORBIT_BREAK_FORCE_FIRE_RANGE
+            if orbit_force_shot:
+                should_fire = in_force_range
+            elif has_los and dist < fire_range:
+                should_fire = (
+                    target_bearing < config.ORBIT_BREAK_FIRE_BEARING
+                    or abs(angle_diff) < 0.78
+                    or abs(self._angle_diff(ship.angle, to_target)) < 0.72
+                )
+            else:
+                should_fire = False
+        else:
+            cone = fire_cone
+            if self._in_weapon_sweet_spot(ship, dist):
+                cone = min(0.95, fire_cone + 0.18)
+            if solo_dogfight and engage_quality >= config.AI_ENGAGE_QUALITY_THRESHOLD:
+                cone = min(0.98, cone + 0.14)
+            should_fire = should_fire and abs(angle_diff) < cone
+
+        speed = vec_len(ship.velocity)
+        if thrust > 0.3 and speed < 25:
+            self.stuck_timer += dt
+        else:
+            self.stuck_timer = max(0.0, self.stuck_timer - dt * 2)
+
+        if self.stuck_timer > 0.8 and not shield_ramming:
+            thrust = -0.8
+            strafe = self.flank_sign
+            rotate_dir = -rotate_dir if rotate_dir != 0 else self.flank_sign
+            if self.stuck_timer > 1.6:
+                self.stuck_timer = 0.0
+                self.flank_sign *= -1
+
+        if vec_len(avoid) > 0.8 and speed < 40 and not shield_ramming:
+            avoid_dir = math.atan2(avoid[1], avoid[0])
+            slide = self._angle_diff(ship.angle, avoid_dir)
+            if abs(slide) > 0.3:
+                strafe = 1.0 if slide > 0 else -1.0
+            thrust = max(thrust, 0.6)
+
+        hurt_ship = ship.health < ship.max_health * config.AI_INJURY_HEALTH_RATIO
+        if not shield_ramming:
+            ram_brake = self._ram_avoid_thrust(ship, others)
+            if ram_brake is not None:
+                thrust = ram_brake
+                strafe *= 0.4
+            thrust, strafe = self._injury_speed_control(ship, thrust, strafe, dist)
+        if thrust < 0 and (dist > 220 or -closing > 50) and not hurt_ship:
+            thrust = 0.2 if dist > 300 else 0.0
+
+        if strafe != 0:
+            ship.apply_thrust(strafe * 1.57, dt)
+
+        will_fire = should_fire and ship.can_fire()
+        if tail_gunner:
+            mode = "tail_gunner"
+        elif shield_ramming:
+            mode = "shield_ram"
+        elif seeking_powerup:
+            mode = "powerup"
+        elif panicking:
+            mode = "panic"
+        elif kiting:
+            mode = "kite"
+        elif breaking_orbit:
+            mode = "orbit_break"
+        else:
+            mode = "fight"
+        self.last_context = AIDecisionContext(
+            mode=mode,
+            target_id=target.ship_id,
+            target_dist=dist,
+            caution=caution,
+            behind_target=behind_target,
+            tail_gunner=tail_gunner,
+            panicking=panicking,
+            kiting=kiting,
+            shield_ramming=shield_ramming,
+            seeking_powerup=seeking_powerup,
+            breaking_orbit=breaking_orbit,
+            engage_quality=engage_quality,
+            rotate=rotate_dir,
+            thrust=thrust,
+            fired=will_fire,
+        )
+        return rotate_dir, thrust, will_fire

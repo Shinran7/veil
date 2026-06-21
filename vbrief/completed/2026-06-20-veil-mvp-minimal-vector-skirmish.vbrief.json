@@ -1,0 +1,122 @@
+{
+  "vBRIEFInfo": {
+    "version": "0.6",
+    "author": "agent:deft-directive-setup",
+    "description": "Veil MVP — complete playable prototype",
+    "created": "2026-06-20T00:00:00Z",
+    "updated": "2026-06-20T00:00:00Z"
+  },
+  "plan": {
+    "title": "Veil MVP — Minimal Vector Skirmish",
+    "status": "completed",
+    "narratives": {
+      "Description": "Build the complete Veil MVP: wave-based Human Mode, AI Arena spectator mode, vector aesthetics, Newtonian physics, variant-weighted ramming, rebindable controls, sound, and persisted high scores.",
+      "Origin": "Ingested from specification.txt; operator decisions locked 2026-06-20.",
+      "Acceptance": "Runnable at 60 FPS. Human Mode: ship pick at start, bounded arena, wave progression with jittered enemy counts, random enemy variants, power-up spawns, alternate weapon types, game over + score on death, local high scores. AI Arena: all-AI battle, pause on winner, auto-restart after delay; toggle via Pause menu (on-screen) or bound key. Sound via pygame.mixer. Controls rebindable with Restore Defaults. Window title Veil, default 1280x768 resizable. requirements.txt present.",
+      "Overview": "Single MVP scope. Includes sound, high scores, power-ups, and alternate weapon types. Late-wave arena obstacles scale difficulty. Deferred post-MVP: multiple arena sizes, mid-run hull swap.",
+      "Requirements": "FR-1: Ship class with polygon hull, position/velocity/angle/angular velocity/health/thrust/weapon cooldown.\nFR-2: Three ship variants (Light Fighter, Balanced Interceptor, Heavy Gunship) with distinct stats.\nFR-3: Newtonian physics with optional drag for controllability.\nFR-4: Projectiles — fast-moving, limited lifetime, damage on hit.\nFR-5: Collision + projectile damage; ramming damage variant-weighted (light: dangerous self-damage; heavy: viable ramming tactic).\nFR-6: Ships destroyed at zero health with explosion particle effect.\nFR-7: Particle system for engine trails, hit sparks, explosions.\nFR-8: Human Mode — wave-based progression, increasing difficulty per wave.\nFR-9: Enemy count per wave uses jitter scaled by wave/stage number (not fixed count).\nFR-10: Enemies spawn as random variants every wave/spawn.\nFR-11: Ship selection at game start — Light, Balanced, or Heavy.\nFR-12: Human Mode death — game over screen with final score.\nFR-13: High scores persisted locally across sessions (Human Mode).\nFR-14: AI Arena Mode — all ships AI-controlled.\nFR-15: AI Arena — battle until one ship remains; pause on winner; show stats; auto-restart after short delay.\nFR-16: AI Arena on-screen toggle only in Pause menu; keyboard rebind for toggle may still work in-game.\nFR-17: Seamless Human ↔ AI Arena mode switching when toggled.\nFR-18: AI behaviors — chase/attack, evasion when damaged, personalities, lead-prediction aiming.\nFR-19: Bounded arena (wall bounce, no wrap); spawn points at edges.\nFR-20: Static arena obstacles in later waves as difficulty scales.\nFR-21: Score from kills, survival time, and wave reached; health bars, wave number, mode indicator UI.\nFR-22: Default controls per spec; all rebindable (keyboard incl. NumPad, mouse buttons, wheel); Pause → Controls; Restore Defaults; persist to local config.\nFR-23: Visual effects — starfield, nebula haze, vector ships, projectile trails, explosion screen flash.\nFR-24: Sound effects via pygame.mixer (engine, fire, hit, explosion, UI).\nFR-25: Power-ups spawn in arena during waves — temporary boosts (e.g. fire-rate, shield, weapon upgrade); minimal vector visuals; AI may collect where applicable.\nFR-26: At least one alternate weapon type beyond default primary (e.g. spread, rapid, or charged shot), obtainable via power-up and/or wave milestone.\nFR-27: requirements.txt with pygame dependency.\nNFR-1: 60 FPS with 8–12 ships + particles.\nNFR-2: Python 3 + Pygame only.\nNFR-3: Modular layout: main.py, ship.py, ai.py, particle.py, utils.py (+ controls/bindings as needed).\nNFR-4: Tunable constants at top of files.\nNFR-5: Default resolution 1280x768, window resizable; window title Veil.",
+      "Traces": "FR-1 through FR-27, NFR-1 through NFR-5; operator decisions 2026-06-20.",
+      "OpenDecisions": "None — all MVP decisions locked. Wave enemy-count formula and obstacle layout are implementation tuning (constants), not design blockers."
+    },
+    "metadata": {
+      "kind": "story",
+      "capacityBucket": "mvp",
+      "completedAt": "2026-06-20T21:26:55Z"
+    },
+    "items": [
+      {
+        "title": "Scaffold — requirements.txt, modules, Veil window 1280x768, 60 FPS loop",
+        "status": "proposed",
+        "narrative": {
+          "Traces": "NFR-2, NFR-3, NFR-5, FR-25",
+          "Action": "Project skeleton, resizable window titled Veil."
+        }
+      },
+      {
+        "title": "Ship variants + physics + variant-weighted ramming",
+        "status": "proposed",
+        "narrative": {
+          "Traces": "FR-1, FR-2, FR-3, FR-5",
+          "Action": "Three hull types; collision damage scales by variant."
+        }
+      },
+      {
+        "title": "Combat — projectiles, alternate weapons, power-ups, destruction, particles",
+        "status": "proposed",
+        "narrative": {
+          "Traces": "FR-4, FR-6, FR-7, FR-23, FR-25, FR-26",
+          "Action": "Default + alternate fire modes; wave power-up spawns; explosions and visual juice."
+        }
+      },
+      {
+        "title": "AI controller — personalities, lead prediction",
+        "status": "proposed",
+        "narrative": {
+          "Traces": "FR-18",
+          "Action": "Modular AI attachable to any ship."
+        }
+      },
+      {
+        "title": "Input — rebind UI, NumPad/mouse/wheel, Restore Defaults, persist",
+        "status": "proposed",
+        "narrative": {
+          "Traces": "FR-22",
+          "Action": "Pause → Controls; binding file; conflict checks."
+        }
+      },
+      {
+        "title": "Human Mode — ship pick, waves, jittered spawns, random variants, game over",
+        "status": "proposed",
+        "narrative": {
+          "Traces": "FR-8, FR-9, FR-10, FR-11, FR-12, FR-21",
+          "Action": "Start screen ship select; wave loop; scaling difficulty."
+        }
+      },
+      {
+        "title": "Arena — bounded walls, edge spawns, late-wave obstacles",
+        "status": "proposed",
+        "narrative": {
+          "Traces": "FR-19, FR-20",
+          "Action": "Bounce physics; obstacles appear as waves climb."
+        }
+      },
+      {
+        "title": "AI Arena — spectator battle, pause on winner, auto-restart",
+        "status": "proposed",
+        "narrative": {
+          "Traces": "FR-14, FR-15, FR-16, FR-17",
+          "Action": "Pause-menu toggle; winner pause + countdown restart."
+        }
+      },
+      {
+        "title": "Audio + high scores + minimal HUD",
+        "status": "proposed",
+        "narrative": {
+          "Traces": "FR-13, FR-21, FR-24",
+          "Action": "pygame.mixer SFX; local high-score file; score/wave/health UI."
+        }
+      },
+      {
+        "title": "Tests + polish",
+        "status": "proposed",
+        "narrative": {
+          "Traces": "NFR-1, NFR-4",
+          "Action": "Headless tests for logic modules; omit main.py from coverage."
+        }
+      }
+    ],
+    "tags": [
+      "game",
+      "mvp",
+      "pygame"
+    ],
+    "references": [
+      {
+        "uri": "specification.txt",
+        "type": "x-vbrief/user-request",
+        "title": "Project specification (specification.txt)"
+      }
+    ],
+    "updated": "2026-06-20T21:26:55Z"
+  }
+}

@@ -1,0 +1,54 @@
+version: '3'
+
+set: [errexit, nounset, pipefail]
+
+vars:
+  CLOUDGOV_VERSION: v1.1.0
+  CLOUDGOV_UPSTREAM_DIR: deployments/cloud-gov/upstream
+  CLOUDGOV_EXPORT_DIR: .deft/cloud.gov
+  CLOUDGOV_ARCHIVE: '{{.CLOUDGOV_UPSTREAM_DIR}}/cloud-gov-instructions-{{.CLOUDGOV_VERSION}}.tar.gz'
+  CLOUDGOV_EXTRACT_DIR: '{{.CLOUDGOV_UPSTREAM_DIR}}/cloud-gov-instructions-1.1.0'
+
+tasks:
+  cloudgov:sync:
+    desc: Sync pinned cloud-gov-instructions release to deployments/cloud-gov/upstream
+    cmds:
+      - mkdir -p {{.CLOUDGOV_UPSTREAM_DIR}}
+      - curl -L https://github.com/adhocteam/cloud-gov-instructions/archive/refs/tags/{{.CLOUDGOV_VERSION}}.tar.gz -o {{.CLOUDGOV_ARCHIVE}}
+      - tar -xzf {{.CLOUDGOV_ARCHIVE}} -C {{.CLOUDGOV_UPSTREAM_DIR}}
+    generates:
+      - '{{.CLOUDGOV_ARCHIVE}}'
+      - '{{.CLOUDGOV_EXTRACT_DIR}}'
+
+  cloudgov:export:
+    desc: Export Copilot-ready cloud.gov instructions to .deft/cloud.gov
+    vars:
+      OUT_DIR: '{{.OUT_DIR | default .CLOUDGOV_EXPORT_DIR}}'
+    cmds:
+      - mkdir -p {{.OUT_DIR}}/.github/instructions {{.OUT_DIR}}/.github/agents {{.OUT_DIR}}/.github/skills
+      - cp deployments/cloud-gov/overview.md {{.OUT_DIR}}/.github/copilot-instructions.md
+      - cp deployments/cloud-gov/deployment.md {{.OUT_DIR}}/.github/instructions/deployment.instructions.md
+      - cp deployments/cloud-gov/manifest.md {{.OUT_DIR}}/.github/instructions/manifest.instructions.md
+      - cp deployments/cloud-gov/services.md {{.OUT_DIR}}/.github/instructions/services.instructions.md
+      - cp deployments/cloud-gov/cicd.md {{.OUT_DIR}}/.github/instructions/cicd.instructions.md
+      - cp deployments/cloud-gov/security.md {{.OUT_DIR}}/.github/instructions/security.instructions.md
+      - cp deployments/cloud-gov/logging.md {{.OUT_DIR}}/.github/instructions/logging.instructions.md
+      - cp deployments/cloud-gov/agents.md {{.OUT_DIR}}/AGENTS.md
+      - cp deployments/cloud-gov/agents/compliance-docs.md {{.OUT_DIR}}/.github/agents/compliance-docs.agent.md
+      - cp deployments/cloud-gov/skills/cf-troubleshoot.md {{.OUT_DIR}}/.github/skills/cf-troubleshoot.md
+      - cp deployments/cloud-gov/LICENSE.md {{.OUT_DIR}}/LICENSE.md
+    sources:
+      - deployments/cloud-gov/**/*.md
+    generates:
+      - '{{.OUT_DIR}}/.github/copilot-instructions.md'
+      - '{{.OUT_DIR}}/.github/instructions/deployment.instructions.md'
+      - '{{.OUT_DIR}}/.github/instructions/manifest.instructions.md'
+      - '{{.OUT_DIR}}/.github/instructions/services.instructions.md'
+      - '{{.OUT_DIR}}/.github/instructions/cicd.instructions.md'
+      - '{{.OUT_DIR}}/.github/instructions/security.instructions.md'
+      - '{{.OUT_DIR}}/.github/instructions/logging.instructions.md'
+      - '{{.OUT_DIR}}/.github/agents/compliance-docs.agent.md'
+      - '{{.OUT_DIR}}/.github/skills/cf-troubleshoot.md'
+      - '{{.OUT_DIR}}/AGENTS.md'
+      - '{{.OUT_DIR}}/LICENSE.md'
+    method: checksum

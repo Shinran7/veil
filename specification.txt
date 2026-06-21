@@ -1,0 +1,125 @@
+Project Specification: Veil
+1. Overview
+
+Title: Veil
+Genre: Minimalist 2D top-down space combat arena
+Core Loop: Elegant vector ships fight in a sparse arena. Play as a human pilot or watch fully autonomous AI battles.
+Target Scope: Small, polished, fun prototype (MVP). Complete, runnable game with high replayability via AI mode.
+Tone/Vibe: Clean, technical, meditative sci-fi minimalism. Satisfying combat without visual noise.
+Platform: Desktop Python app (Pygame). Windowed, resizable, 60 FPS target. Default resolution 1280x768.
+Win / End Conditions:
+Human mode: Game over on death with final score; high scores persist locally.
+AI Arena mode: Battle runs until one ship remains; pause on winner, show stats, auto-restart after a short delay.
+
+Success Criteria: Smooth controls, elegant vector visuals, compelling AI fights, sound, high scores, easy to extend.
+
+2. Aesthetics (Vector Style)
+
+Color Palette: Primarily monochrome (deep black background, white/gray ships and stars) with subtle neon accents (cyan/blue for player, red/orange for enemies, bright white/yellow for lasers/explosions).
+Ship Style: Sharp polygonal outlines + thin filled areas. Simple geometric shapes for hull, wings, cockpit, and engines. Glowing engine trails (fading lines/particles). No textures or heavy detail.
+Effects:
+Starfield: Static + slow parallax small white/gray dots.
+Faint nebula haze: Very soft, low-opacity particle glows.
+Projectiles: Thin bright lines or small glowing circles with trails.
+Explosions/Hits: Burst of fading particles + screen flash on big hits.
+
+UI: Minimal — score, health bars (thin lines), mode indicator (Human / AI Arena), wave number. Clean sans-serif font. Window title: Veil.
+Resolution: Default 1280x768, resizable to higher resolutions.
+
+3. Gameplay Modes
+
+Human Mode (default):
+Player picks ship variant (Light / Balanced / Heavy) at start.
+Wave-based progression with increasing difficulty.
+Enemy count per wave uses jitter scaled by wave/stage number.
+Enemies spawn as random variants every time.
+
+AI Arena Mode (toggle from Pause menu or bound key):
+AI controls all ships (including the former player ship).
+Pure spectator/autonomous combat.
+When one ship remains, pause, show live stats, auto-restart arena after a short delay.
+
+Mode Switching: Seamless. AI takes over instantly when toggled on; player regains control when toggled off. On-screen AI Arena toggle available only while paused (Pause menu item); keyboard binding may still toggle in-game if rebound.
+
+4. Controls (Human Mode)
+
+Default bindings (all rebindable — see FR-18):
+Rotate left: Left arrow or A
+Rotate right: Right arrow or D
+Thrust forward: Up arrow or W
+Strafe left: Q
+Strafe right: E
+Fire primary weapon: Space (hold or tap for rate of fire)
+Toggle AI Arena Mode: Tab (default; rebindable)
+Pause: P
+Quit: Esc
+
+FR-18 (must): Pause menu → Controls item opens rebind UI. Player can bind every action to keyboard keys (including NumPad — digits 0–9, operators, Enter, decimal, arithmetic keys; NumPad keys are distinct from main keyboard number row), mouse buttons (left/right/middle/side), or mouse wheel (up/down). Bindings persist to a local config file and reload on startup; duplicate-binding conflicts rejected with clear feedback. Pause menu → Controls includes Restore Defaults.
+
+5. Ships & Entities
+
+Ship Class (reusable for player + enemies):
+Defined by list of points for polygon hull.
+Properties: position, velocity, angle, angular velocity, health, thrust level, weapon cooldown.
+Visuals: Polygon outline + fill + engine glow lines + small cockpit detail.
+
+Ship Variants (3 types):
+Light Fighter: Fast, agile, lower health. Ramming is dangerous — high collision self-damage.
+Balanced Interceptor: Good all-rounder. Moderate ramming risk.
+Heavy Gunship: Slower, higher health/firepower. Ramming is a valid tactic — lower self-damage, higher impact to targets.
+
+Projectiles: Fast-moving, limited lifetime, damage on hit.
+Particles: Reusable system for engine trails, hit sparks, explosions.
+
+6. Core Mechanics
+
+Physics: Simple Newtonian (velocity, rotation, optional drag/friction for controllability).
+Combat:
+Line-of-sight aiming with lead prediction for AI.
+Collision damage (ship-ship, variant-weighted) + projectile damage.
+Ships destroyed on zero health with explosion effect.
+
+AI Behaviors (modular controller attachable to any ship):
+Chase/attack nearest threat.
+Basic evasion when damaged.
+Different personalities per variant (aggressive, defensive, flanker).
+Capable of dogfighting, circling, and coordinated attacks in AI Arena mode.
+
+Arena: Bounded rectangle — ships bounce off walls (no wrap-around). Spawn points around edges.
+Obstacles: Static arena obstacles introduced in later waves as difficulty scales.
+Progression: Wave-based. Difficulty increases per wave (enemy count jitter, tougher mix, obstacles). Score based on kills + survival time + wave reached.
+Power-ups: Spawn in arena during waves — temporary weapon upgrades, fire-rate boosts, shields, or similar. Keep minimal and readable (vector style, no loot clutter).
+Weapon types: At least one alternate fire mode beyond the default primary (e.g. spread, rapid, or charged shot) obtainable via power-up or wave milestone.
+Balance: Tunable constants for thrust, fire rate, health, ramming damage, etc.
+
+7. Technical Requirements
+
+Language / Library: Python 3 + Pygame only (no other external deps beyond what's pip-installable in one command).
+Structure (recommended):
+main.py — entry point and game loop.
+ship.py — Ship class.
+ai.py — AI controller.
+particle.py — Particle system.
+utils.py — helpers (vector math, drawing).
+controls.py or bindings config — input binding map + persistence (as needed).
+
+Performance: Smooth at 60 FPS with 8–12 ships + particles.
+Code Quality: Clean, commented, modular, easy to extend.
+Setup: Include requirements.txt or inline pip install note.
+Audio: Simple sound effects via pygame.mixer (engine, fire, hit, explosion, UI).
+Persistence: Local high-score file (Human Mode).
+
+8. Deliverables & Polish
+
+Runnable game with both modes working.
+Ship selection at start.
+Wave progression with scaling difficulty and late-wave obstacles.
+Sound effects, persisted high scores, and power-ups / alternate weapon types.
+Satisfying feel: Responsive controls, juicy explosions, emergent AI fights.
+Configurable constants at top of files for easy tuning.
+Comments explaining key systems.
+
+9. Deferred (post-MVP)
+
+Different arena sizes (beyond obstacle placement in fixed arena).
+Ship customization mid-run (swap hulls during play).

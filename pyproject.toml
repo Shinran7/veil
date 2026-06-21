@@ -1,0 +1,23 @@
+[project]
+name = "veil"
+version = "0.1.0"
+description = "Minimal Vector Skirmish — 2D space combat arena"
+requires-python = ">=3.11"
+dependencies = ["pygame>=2.5.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0", "pytest-cov>=5.0.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+omit = [
+    "tests/*",
+    "main.py",
+    "audio.py",
+    "*/.venv/*",
+]
+
+[tool.coverage.report]
+fail_under = 85

@@ -1,0 +1,31 @@
+# User Preferences
+
+Legend (from RFC2119): !=MUST, ~=SHOULD, ≉=SHOULD NOT, ⊗=MUST NOT, ?=MAY.
+
+**Rule Precedence**: This file has HIGHEST precedence - overrides all other deft rules.
+Only add items here that **override or extend** the defaults in `deft/main.md` and related files.
+
+## 👤 Identity
+
+Address the user as: **[Your Name]**
+
+## 📏 Overrides
+
+<!-- Only specify if different from deft defaults (e.g., coverage ≥85%, hyphens in filenames) -->
+
+**Primary Languages**:
+- [Language 1 - e.g., Python, Go, TypeScript]
+- [Language 2]
+
+**Code Style** (preferences beyond language defaults):
+- [e.g., Prefer functional over OOP]
+- [e.g., Explicit over implicit]
+
+## 🎯 Custom Rules
+
+<!-- Rules unique to you that aren't covered by deft core -->
+
+---
+
+**Note**: You can edit this file anytime to update your preferences.
+**See**: [deft/main.md](./deft/main.md) for framework defaults.

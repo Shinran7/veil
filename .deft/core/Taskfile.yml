@@ -1,0 +1,925 @@
+version: '3'
+
+vars:
+  PROJECT_NAME: deft
+  # VERSION is resolved dynamically (#723) so `task build` produces
+  # `dist/deft-{version}.{zip,tar.gz}` matching the in-flight release.
+  # Resolution priority (mirrors scripts/resolve_version.py):
+  #   1. $DEFT_RELEASE_VERSION env var (set by scripts/release.py:run_build
+  #      so `task release -- 0.21.0` builds dist/deft-0.21.0.zip).
+  #   2. `git describe --tags --abbrev=0` stripped of leading `v`.
+  #   3. `0.0.0-dev` fallback for fresh checkouts with no tags.
+  # The previous hard-coded literal (`VERSION: 0.20.0`) was the root cause
+  # of #723: every release after v0.20.0 produced a stale artifact name
+  # because nothing in the release pipeline updated the Taskfile literal.
+  # Inline POSIX sh (run by go-task's embedded mvdan/sh interpreter so the
+  # block is cross-platform on Windows / macOS / Linux without requiring
+  # uv/python at parse time -- the Python equivalent lives in
+  # scripts/resolve_version.py for Python callers + regression tests).
+  VERSION:
+    sh: |
+      if [ -n "$DEFT_RELEASE_VERSION" ]; then
+        printf '%s' "$DEFT_RELEASE_VERSION"
+      elif tag=$(git describe --tags --abbrev=0 2>/dev/null); then
+        printf '%s' "${tag#v}"
+      else
+        printf '0.0.0-dev'
+      fi
+  # Each included sub-taskfile (tasks/*.yml) defines its own DEFT_ROOT as
+  # `{{joinPath .TASKFILE_DIR ".."}}` so scripts can be dispatched via
+  # `{{.DEFT_ROOT}}/scripts/...` on every platform (#566). `joinPath` is
+  # evaluated eagerly by go-task's templating and uses Go's `filepath.Clean`,
+  # which yields a native-separator, `..`-free absolute path that
+  # `uv run python` can open on Windows. The previous
+  # `{{.TASKFILE_DIR}}/../scripts/...` shape mixed native separators with
+  # forward-slash traversal and normalized incorrectly under Windows Python,
+  # dropping the deft/ prefix.
+  #
+  # DEFT_ROOT is intentionally NOT defined here at the root Taskfile level
+  # because go-task re-evaluates var templates at use site in included
+  # subfiles -- a root-level `DEFT_ROOT: '{{.TASKFILE_DIR}}'` would expand
+  # to the subfile's own directory (tasks/) when referenced from a subfile,
+  # not to the deft/ root.
+
+# Top-level env propagates into included taskfiles (Task v3 includes inherit
+# the parent env:). PYTHONUTF8=1 ensures Python scripts invoked from any
+# deft task have UTF-8 stdout/stderr on Windows (cp1252 default would crash
+# on the ✓/→/✗/⚠ symbols emitted by spec_validate / roadmap_render / etc.).
+# Every task that runs Python ALSO sets this in its own env: block as a
+# belt-and-suspenders guard -- see #540 for the full audit.
+#
+# UV_PROJECT is the Layer-1 safety net for #1011: every framework-side
+# `uv run` invocation must resolve against the framework's own pyproject.toml,
+# not an ancestor pyproject.toml that happens to live above the install
+# location on the consumer machine. Without this, `uv run` walks upward
+# from cwd looking for the nearest pyproject.toml and binds to whatever
+# it finds first -- on a typical dev box with a parent workspace
+# pyproject.toml, that workspace's build backend (e.g. unresolvable
+# `setuptools.backends._legacy:_Backend`) crashes during environment
+# resolution before any framework task body runs. UV_PROJECT short-circuits
+# the upward walk by pinning the project root explicitly. {{.TASKFILE_DIR}}
+# at this top-level env: resolves to the directory containing this
+# Taskfile.yml (the framework root), which is exactly the right pin for
+# the framework's own pyproject.toml. CLI `--project` on each call site
+# (Layer 2, see tasks/*.yml) overrides env, which overrides walk -- the
+# CLI flag is the contract; UV_PROJECT is defense-in-depth for any task
+# that drops the flag in a future edit. See #1011 for the full root-cause
+# analysis and the two-layer rationale.
+env:
+  PYTHONUTF8: "1"
+  UV_PROJECT: '{{.TASKFILE_DIR}}'
+
+includes:
+  core:
+    taskfile: ./tasks/core.yml
+    optional: true
+  spec:
+    taskfile: ./tasks/spec.yml
+    optional: true
+  install:
+    taskfile: ./tasks/install.yml
+    optional: true
+  deployments:
+    taskfile: ./tasks/deployments.yml
+    optional: true
+  toolchain:
+    taskfile: ./tasks/toolchain.yml
+    optional: true
+  verify:
+    taskfile: ./tasks/verify.yml
+    optional: true
+  architecture:
+    taskfile: ./tasks/architecture.yml
+    optional: true
+  codebase:
+    taskfile: ./tasks/codebase.yml
+    optional: true
+  change:
+    taskfile: ./tasks/change.yml
+    optional: true
+  commit:
+    taskfile: ./tasks/commit.yml
+    optional: true
+  scope:
+    taskfile: ./tasks/scope.yml
+    optional: true
+  # D15 (#1134): scope:undo audit-log reversibility verb. Standalone
+  # fragment per the post-D12 sub-task convention so the cross-child
+  # coordination contract on tasks/scope.yml does not collide. Inner
+  # task `undo` is exposed as the user-facing alias `task scope:undo`
+  # below.
+  scope-undo:
+    taskfile: ./tasks/scope-undo.yml
+    optional: true
+  swarm:
+    taskfile: ./tasks/swarm.yml
+    optional: false
+  roadmap:
+    taskfile: ./tasks/roadmap.yml
+    optional: true
+  project:
+    taskfile: ./tasks/project.yml
+    optional: true
+  migrate:
+    taskfile: ./tasks/migrate.yml
+    optional: true
+  vbrief:
+    taskfile: ./tasks/vbrief.yml
+    optional: true
+  prd:
+    taskfile: ./tasks/prd.yml
+    optional: true
+  reconcile:
+    taskfile: ./tasks/reconcile.yml
+    optional: true
+  issue:
+    taskfile: ./tasks/issue.yml
+    optional: true
+  pr:
+    taskfile: ./tasks/pr.yml
+    optional: true
+  ci:
+    taskfile: ./tasks/ci.yml
+    optional: true
+  policy:
+    taskfile: ./tasks/policy.yml
+    optional: true
+  framework:
+    taskfile: ./tasks/framework.yml
+    optional: true
+  session:
+    taskfile: ./tasks/session.yml
+    optional: true
+  # #883 Story 1 stub include. The fragment exposes its inner tasks
+  # (`issue:list` / `issue:view` / `issue:close` / `issue:edit`) under the
+  # `scm` namespace key, producing the canonical `scm:issue:*` surface in
+  # `task -l` with no doubled prefix. Forward-compat marker block lives at
+  # the top of `tasks/scm.yml`; the full scm:* namespace lives at #881 and
+  # replaces this stub wholesale when it lands.
+  scm:
+    taskfile: ./tasks/scm.yml
+    optional: true
+  # #883 Story 2 cache + quarantine layer. Five-command surface
+  # (cache:put / cache:get / cache:invalidate / cache:fetch-all /
+  # cache:prune) under the canonical `cache:` namespace via the include
+  # key. Forward-compat: future v2 cache surfaces (cache:check /
+  # cache:refresh / cache:doctor / cache:stats / quarantine:scan) are
+  # deferred per the epic deferred_to_v2 list and land here when v2
+  # ships.
+  cache:
+    taskfile: ./tasks/cache.yml
+    optional: true
+  # Triage v1 fragment includes (#845 epic, #883 Story 3 rebind onto cache:*).
+  #
+  # Three standalone fragments authored by stories A3, A4, and A6
+  # respectively (the legacy A1 `triage-cache` fragment was deleted in
+  # #883 Story 3 -- the unified `cache:*` surface above is the
+  # single content-mirroring layer). Each fragment is `optional: true`
+  # so the parent Taskfile parses cleanly even when a sibling fragment
+  # has not yet landed.
+  #
+  # Namespacing: go-task v3 prefixes inner task names with the include
+  # key. Two includes cannot share a single namespace key, so the
+  # fragments use unique keys derived from the file basename. The
+  # user-facing `task triage:bootstrap` / `task triage:accept` /
+  # `task triage:bulk-*` etc. forms are exposed via top-level alias
+  # tasks below.
+  triage-actions:
+    taskfile: ./tasks/triage-actions.yml
+    optional: true
+  triage-bulk:
+    taskfile: ./tasks/triage-bulk.yml
+    optional: true
+  triage-bootstrap:
+    taskfile: ./tasks/triage-bootstrap.yml
+    optional: true
+  # #1468: `task triage:reconcile` audit-log self-heal. Inner task
+  # `reconcile` is exposed as the user-facing alias `task triage:reconcile`
+  # in the alias block below.
+  triage-reconcile:
+    taskfile: ./tasks/triage-reconcile.yml
+    optional: true
+  # D12 (#1131): typed plan.policy.triageScope[] subscription surface.
+  # Inner task `scope` is exposed as the user-facing alias `task triage:scope`
+  # in the alias block below.
+  triage-scope:
+    taskfile: ./tasks/triage-scope.yml
+    optional: true
+  # D14 (#1133): subscription drift detector. Inner task `scope-drift` is
+  # exposed as the user-facing alias `task triage:scope-drift` in the
+  # alias block below.
+  triage-scope-drift:
+    taskfile: ./tasks/triage-scope-drift.yml
+    optional: true
+  # D14 (#1133): subscribe / unsubscribe mutation verbs. Inner tasks
+  # `subscribe` / `unsubscribe` are exposed as the user-facing aliases
+  # `task triage:subscribe` / `task triage:unsubscribe` below.
+  triage-subscribe:
+    taskfile: ./tasks/triage-subscribe.yml
+    optional: true
+  # D10 (#1129): auto-classification surface. Inner task `classify` is
+  # exposed as the user-facing alias `task triage:classify` in the alias
+  # block below.
+  triage-classify:
+    taskfile: ./tasks/triage-classify.yml
+    optional: true
+  # D2 (#1122): `task triage:summary` one-liner -- status surface invoked by
+  # the session-start ritual (N9 / #1149). Inner task `summary` is exposed
+  # as the user-facing alias `task triage:summary` in the alias block below.
+  triage-summary:
+    taskfile: ./tasks/triage-summary.yml
+    optional: true
+  # D11 (#1128): ranked queue + per-item show + audit-log triage surfaces.
+  # Inner tasks queue/show/audit are exposed as the user-facing aliases
+  # `task triage:queue` / `task triage:show` / `task triage:audit` below.
+  triage-queue:
+    taskfile: ./tasks/triage-queue.yml
+    optional: true
+  # N3 (#1143): `task triage:welcome` 6-phase onboarding ritual. Inner
+  # task `welcome` is exposed as the user-facing alias `task triage:welcome`
+  # in the alias block below.
+  triage-welcome:
+    taskfile: ./tasks/triage-welcome.yml
+    optional: true
+  # N6 (#1146): `task triage:smoketest` end-to-end synthetic test of the
+  # cache-as-operator-working-set surface. Inner task `smoketest` is
+  # exposed as the user-facing alias `task triage:smoketest` in the
+  # alias block below.
+  triage-smoketest:
+    taskfile: ./tasks/triage-smoketest.yml
+    optional: true
+  # Windows maintainer onboarding fragment (#902). Exposes the inner task
+  # `toolchain` as `task setup:toolchain`. Note: the root-level `setup` task
+  # below (git-hooks bootstrap) coexists with `setup:toolchain` because
+  # go-task treats them as distinct task names.
+  setup:
+    taskfile: ./tasks/setup.yml
+    optional: true
+  # CHANGELOG.md union-merge helper (#911). Exposes
+  # `task changelog:resolve-unreleased` -- the canonical swarm-cascade Phase 6
+  # Step 1 surface that replaces the older HEAD-take-and-discard pattern that
+  # silently dropped rebasing-branch CHANGELOG entries on every cascade rebase.
+  # See skills/deft-directive-swarm/SKILL.md Phase 6 Step 1 for the manual-
+  # fallback contract; the include is `optional: true` so the parent Taskfile
+  # parses cleanly when the fragment is absent (rolling-merge tolerance).
+  changelog:
+    taskfile: ./tasks/changelog.yml
+    optional: true
+  # Wipe-and-reinstall relocator (#992 PR2). Exposes `task relocate` --
+  # forwards user-facing flags (`--confirm` / `--dry-run` / `--force` /
+  # `--rollback` / `--no-snapshot` / `--json` / `--quiet`) via
+  # {{.CLI_ARGS}}; per `conventions/task-caching.md` no `sources:` /
+  # `generates:` so the recovery flags reach the script (#574). The
+  # include is `optional: true` for rolling-merge tolerance.
+  relocate:
+    taskfile: ./tasks/relocate.yml
+    optional: true
+  # N7 (#1147): slice:* fragment exposing `task slice:record-existing`
+  # (retrofit slices.jsonl for hand-filed cohorts) + `task slice:list`
+  # (read surface). Include key `slice-record` (not `slice`) so the
+  # fragment-namespace forms (`slice-record:record-existing`,
+  # `slice-record:list`) do NOT collide with the user-facing
+  # `slice:record-existing` / `slice:list` aliases defined below.
+  # Inner tasks are `internal: true`; aliases at the root surface the
+  # documented user-facing names per the established triage:* / scope:*
+  # convention.
+  slice-record:
+    taskfile: ./tasks/slice.yml
+    optional: true
+  # Capacity allocation accounting surface (#1419 Delivery Slice 4). Exposes
+  # `task capacity:show` (advisory, offline target-vs-actual bucket mix). The
+  # companion `task verify:capacity` lives in tasks/verify.yml and is
+  # DELIBERATELY absent from the `task check` aggregate -- capacity is
+  # advise-by-default and must never fail-closed on the framework tree.
+  # `optional: true` for rolling-merge tolerance.
+  capacity:
+    taskfile: ./tasks/capacity.yml
+    optional: true
+  # Pack-slicing surface (#1283 design, #1294 pilot, ADR-001 Layer B). Exposes
+  # `task packs:slice` (named-slice API), `task packs:render` (regenerate the
+  # meta/lessons.md projection), and `task packs:verify-drift` (the drift gate,
+  # also surfaced as the user-facing alias `task verify:pack-drift` below and
+  # wired into `check:framework-source`). `optional: true` for rolling-merge
+  # tolerance.
+  packs:
+    taskfile: ./tasks/packs.yml
+    optional: true
+
+tasks:
+  default:
+    desc: List all available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  # Backward-compatible aliases -- project convention is `task check`, `task test`, etc.
+  check:
+    desc: "Run the context-appropriate pre-commit gate: full framework self-check in this repo, consumer-safe gate from vendored installs (#1519)."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.TASKFILE_DIR}}" run python "{{.TASKFILE_DIR}}/scripts/_project_context.py" --dispatch-task-check --framework-root "{{.TASKFILE_DIR}}" --project-root "{{.USER_WORKING_DIR}}"
+
+  check:framework-source:
+    desc: "Run all framework source-repo pre-commit checks explicitly (skips @pytest.mark.slow tests via pyproject addopts -- run `task check:slow` for the slow lane, #975)."
+    deps:
+      - core:validate
+      - core:lint
+      - core:test
+      - toolchain:check
+      - verify:stubs
+      - verify:links
+      - verify:rule-ownership
+      - verify:branch
+      - verify:encoding
+      - verify:vbrief-conformance
+      - verify:destructive-gh-verbs
+      - verify:scm-boundary
+      - verify:no-task-runtime
+      - verify:cache-fresh
+      - verify:pack-drift
+      - verify-wip-cap-framework-self-check
+      - vbrief:validate
+      - codebase:validate-structure
+      - verify-strategy-output
+    cmds:
+      - echo "All checks passed"
+
+  check:consumer:
+    desc: "Run the consumer-safe Deft quality gate for vendored installs (#1519)."
+    deps:
+      - doctor
+      - toolchain:check
+      - verify:branch
+      - verify:cache-fresh
+      - verify:wip-cap
+      - vbrief:validate
+      - verify-strategy-output
+    cmds:
+      - echo "Consumer checks passed"
+
+  # D4 (#1124): framework self-check wrapper that passes
+  # --allow-over-cap so deft's own landing-day overage (pending/+active/
+  # currently >> 10, resolved via D1 scope:demote --batch per umbrella
+  # v3) does not break framework `task check`. Consumer projects depend
+  # on `verify:wip-cap` directly (without --allow-over-cap) so a
+  # stale-branch / --force-merge over-cap state fails their `task check`
+  # loudly. Mirrors the verify:cache-fresh / verify:branch
+  # --allow-missing-* tolerance pattern.
+  verify-wip-cap-framework-self-check:
+    internal: true
+    desc: "Framework self-check shim for verify:wip-cap (#1124)."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - task: verify:wip-cap
+        vars:
+          CLI_ARGS: "--allow-over-cap"
+
+  # s2-deterministic-gate (#1166): deterministic validation gate for strategy
+  # output shape. Runs on every `task check` (including CI). Implemented in
+  # scripts/validate_strategy_output.py. Respects Grok Build Windows rules
+  # (plain uv python invocation, no pipes in this Taskfile context).
+  verify-strategy-output:
+    desc: "Deterministic v0.20 strategy output shape gate (#1166 s2). Fails on non-date-prefixed vBRIEFs in lifecycle dirs, missing PROJECT-DEFINITION.vbrief.json, or legacy specification.vbrief.json in user projects."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.TASKFILE_DIR}}" run python "{{.TASKFILE_DIR}}/scripts/validate_strategy_output.py" --project-root "{{.USER_WORKING_DIR}}"
+
+  # Pack-projection drift gate (#1294 / #1283, ADR-001). User-facing alias for
+  # `packs:verify-drift`, defined at the root Taskfile so it carries the
+  # documented `verify:*` prefix that the gate stack + `task check` reference
+  # while the implementation lives in the `packs:` include namespace (mirrors
+  # the established triage:* / scope:* alias precedent above). Wired into
+  # `check:framework-source` deps. Forwards {{.CLI_ARGS}} so --source / --output
+  # overrides reach the script.
+  verify:pack-drift:
+    desc: "Fail when meta/lessons.md drifts from the canonical lessons-pack source (#1294 / ADR-001). Alias for packs:verify-drift; wired into `task check`."
+    cmds:
+      - task: packs:verify-drift
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  verify:no-task-runtime:
+    desc: "Fail when runtime Python code hard-depends on go-task (#1659)."
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.TASKFILE_DIR}}" run python "{{.TASKFILE_DIR}}/scripts/verify_no_task_runtime.py"
+
+  # `task check:slow` runs the @pytest.mark.slow lane that the default
+  # `task check` skips (#975). The slow lane is dominated by the
+  # triage_bootstrap watchdog regression suite (5 of the 6 marked tests),
+  # which burns ~5.85s on real time.sleep / thread joins -- the proper
+  # monkeypatch refactor is tracked as a follow-up to #975. The `-o
+  # addopts=` reset overrides the pyproject default of `-m 'not slow'`
+  # so the `-m slow` selector here actually picks up the marked tests.
+  check:slow:
+    desc: "Run the @pytest.mark.slow test lane (watchdog regression suite excluded from `task check` by default, #975)"
+    cmds:
+      # `--project` pins uv to the framework root so ancestor pyproject.toml
+      # files cannot hijack the resolver via uv's upward walk (#1011).
+      - uv --project "{{.TASKFILE_DIR}}" run pytest tests/ -o addopts= -m slow
+
+  test:
+    desc: Run test suite (alias for core:test)
+    cmds:
+      - task: core:test
+  test:coverage:
+    desc: Run tests with coverage (alias for core:test:coverage)
+    cmds:
+      - task: core:test:coverage
+  lint:
+    desc: Lint and type-check Python code (alias for core:lint)
+    cmds:
+      - task: core:lint
+  fmt:
+    desc: Format Python code (alias for core:fmt)
+    cmds:
+      - task: core:fmt
+  build:
+    desc: Package framework for distribution (alias for core:build)
+    cmds:
+      - task: core:build
+  clean:
+    desc: Clean generated artifacts (alias for core:clean)
+    cmds:
+      - task: core:clean
+  validate:
+    desc: Validate all markdown files (alias for core:validate)
+    cmds:
+      - task: core:validate
+  install:
+    desc: Install deft (alias for install:install)
+    cmds:
+      - task: install:install
+  uninstall:
+    desc: Remove deft entry from AGENTS.md (alias for install:uninstall)
+    cmds:
+      - task: install:uninstall
+  # User-facing upgrade entrypoint (#1061). Aliases the install:upgrade
+  # wrapper that delegates to `run upgrade`. Cited by the doctor's
+  # failure prose and docs/install-manifest.md as the canonical
+  # post-drift repair entrypoint for the AGENTS.md / manifest /
+  # .deft-version triple.
+  upgrade:
+    desc: "Upgrade deft framework -- refresh AGENTS.md + write install manifest + regenerate .deft-version (alias for install:upgrade, #1061)"
+    cmds:
+      - task: install:upgrade
+  stats:
+    desc: Show framework statistics (alias for core:stats)
+    cmds:
+      - task: core:stats
+
+  # #1272: canonical doctor surface -- thin shim that forwards to
+  # ``.deft/core/run doctor``. The ``run`` CLI owns the diagnostic
+  # logic (system deps, framework layout, root Taskfile.yml include
+  # health) and the optional interactive repair path. The task
+  # accepts user-facing flags (``--session`` / ``--fix`` / ``--json``
+  # / ``--quiet``) via ``{{.CLI_ARGS}}`` so per
+  # ``conventions/task-caching.md`` (#574) MUST NOT declare
+  # ``sources:`` / ``generates:`` -- a cached cmds skip would silently
+  # swallow the flags. The deprecated ``task framework:doctor`` task
+  # in ``tasks/framework.yml`` now prints a redaction notice pointing
+  # the operator at this surface.
+  doctor:
+    desc: "Canonical doctor surface (#1272) -- task doctor [-- --session | --fix | --json | --quiet]. Shim for `.deft/core/run doctor`."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.TASKFILE_DIR}}" run --frozen python "{{.TASKFILE_DIR}}/run" doctor {{.CLI_ARGS}}
+
+  setup:
+    desc: "Idempotent local-dev setup: configure git hooks (#747); detect-and-prompt ghx (#884). Sets core.hooksPath=.githooks so .githooks/pre-commit + .githooks/pre-push run."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      # Inline POSIX-sh under go-task's mvdan/sh interpreter -- cross-platform.
+      # `git config core.hooksPath .githooks` is itself idempotent, but we
+      # detect the no-op so the task prints a friendly message rather than
+      # silently re-asserting on every invocation.
+      - |
+        configured=$(git config --get core.hooksPath || true)
+        if [ "$configured" = ".githooks" ]; then
+          echo "✓ core.hooksPath already set to .githooks (no change)."
+        else
+          git config core.hooksPath .githooks
+          echo "✓ core.hooksPath set to .githooks (#747 branch gate active)."
+        fi
+      # #814: Detect a Python interpreter whose stdout defaults to a
+      # non-UTF-8 Windows code page (cp1252 / cp437). Informational only --
+      # the deft hook scripts themselves self-reconfigure to UTF-8 at
+      # main() entry, so this warning surfaces a fact about the user's
+      # environment, not a defect that blocks setup. We do NOT auto-set
+      # PYTHONIOENCODING because mutating the user's environment would
+      # surprise other tooling (out-of-scope per the issue body).
+      - |
+        python_bin="${DEFT_PYTHON:-}"
+        if [ -z "$python_bin" ]; then
+          if command -v python3 >/dev/null 2>&1; then
+            python_bin=python3
+          elif command -v python >/dev/null 2>&1; then
+            python_bin=python
+          fi
+        fi
+        if [ -n "$python_bin" ]; then
+          # NOTE: we explicitly unset PYTHONUTF8 / PYTHONIOENCODING in the
+          # subshell so the probe measures what Python would do under git's
+          # hook environment (which inherits the user's shell, NOT the
+          # Taskfile root env: block). Without the unset, the root-level
+          # `env: PYTHONUTF8: "1"` (#540) masks cp1252 here and the warning
+          # would never surface even when the user actually has the bug.
+          enc=$(unset PYTHONUTF8 PYTHONIOENCODING; "$python_bin" -c "import sys; print((sys.stdout.encoding or '').lower())" 2>/dev/null || true)
+          case "$enc" in
+            cp1252|cp437|charmap)
+              echo ""
+              echo "WARN: Detected Python stdout encoding '$enc' (Windows default). Deft hooks"
+              echo "print non-ASCII glyphs and may crash without UTF-8 stdout. Either:"
+              echo "  (a) set the user-environment variable PYTHONIOENCODING=utf-8 (one-time,"
+              echo "      via System Properties > Environment Variables), OR"
+              echo "  (b) add \$env:PYTHONIOENCODING='utf-8' to your PowerShell profile."
+              echo "The deft hook scripts also self-reconfigure as of #814, so this"
+              echo "warning is informational on current versions."
+              ;;
+          esac
+        fi
+      # #884: ghx adoption -- consent-gated install of the brunoborges/ghx
+      # GitHub CLI cache proxy. Default invocation here passes --check so
+      # `task setup` never prompts on a clean re-run; operators wanting to
+      # opt in run `task setup:ghx` (defined below) which is the
+      # interactive entry point. The script is pure-stdlib so it works
+      # before `uv sync` has run on a fresh worktree; `uv run` is still
+      # the canonical dispatcher to keep the python interpreter consistent
+      # with every other Taskfile-dispatched script. `--project` pins uv
+      # to the framework root so ancestor pyproject.toml files cannot
+      # hijack the resolver via uv's upward walk (#1011).
+      - uv --project "{{.TASKFILE_DIR}}" run python "{{.TASKFILE_DIR}}/scripts/setup_ghx.py" --check
+
+  setup:ghx:
+    desc: "Consent-gated ghx (brunoborges/ghx) installer (#884) -- task setup:ghx [-- --yes]"
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    # Per `conventions/task-caching.md` (#574): no `sources:` / `generates:`
+    # because the script forwards user-facing flags via {{.CLI_ARGS}}
+    # (notably --yes for non-interactive CI / scripted approval).
+    cmds:
+      - uv --project "{{.TASKFILE_DIR}}" run python "{{.TASKFILE_DIR}}/scripts/setup_ghx.py" {{.CLI_ARGS}}
+
+  # Release pipeline tasks (#74 + #716 safety hardening, namespace flatten #718).
+  #
+  # Defined inline at the root Taskfile rather than via `includes: release: ./tasks/release.yml`
+  # because go-task concatenates the namespace key with each inner task name -- so an inner
+  # task named `release:` under namespace `release:` would install as `task release:release`,
+  # not `task release` (the documented invocation in skills/deft-directive-release/SKILL.md
+  # and CHANGELOG entries from #74/#716). See #718 for the full root-cause analysis.
+  #
+  # Sibling pattern: tasks/pr.yml uses inner task name `check-protected-issues` (no `pr:`
+  # repeat) so the include-namespace mechanism produces `pr:check-protected-issues`. The
+  # release pipeline cannot use that pattern because it needs BOTH a top-level `release`
+  # name AND `release:e2e` / `release:publish` / `release:rollback` sub-names.
+  #
+  # Per `conventions/task-caching.md` (#574): tasks that accept user-facing recovery flags
+  # via {{.CLI_ARGS}} (here: --dry-run / --skip-tag / --skip-release / --allow-dirty /
+  # --repo / --no-draft / --allow-low-downloads / --allow-data-loss / --force-strict-0 /
+  # --owner / --keep-repo) MUST NOT declare `sources:` / `generates:` -- the cached `cmds:`
+  # skip would silently discard the recovery flag.
+  #
+  # Path resolution uses `{{.TASKFILE_DIR}}/scripts/<script>.py` directly because these
+  # tasks live in the root Taskfile.yml where `{{.TASKFILE_DIR}}` already resolves to the
+  # deft/ root (no per-subfile DEFT_ROOT joinPath dance is needed -- see Taskfile.yml
+  # header comment for why `DEFT_ROOT` is intentionally absent at the root level).
+  #
+  # Companion scripts: scripts/release.py, scripts/release_publish.py,
+  #                    scripts/release_rollback.py, scripts/release_e2e.py
+  # Companion tests:   tests/cli/test_release.py,
+  #                    tests/cli/test_release_publish.py,
+  #                    tests/cli/test_release_rollback.py,
+  #                    tests/cli/test_release_e2e.py
+  # Refs #74, #233, #642, #635, #709, #710, #716, #718.
+  release:
+    desc: "Automate the v0.X.Y release flow (#74) -- task release -- <version> [--dry-run] [--skip-tag] [--skip-release] [--no-draft]"
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      # `--project` pins uv to the framework root so ancestor pyproject.toml
+      # files cannot hijack the resolver via uv's upward walk (#1011).
+      - uv --project "{{.TASKFILE_DIR}}" run python "{{.TASKFILE_DIR}}/scripts/release.py" {{.CLI_ARGS}}
+
+  release:publish:
+    desc: "Flip a draft GitHub release to public (#716) -- task release:publish -- <version> [--dry-run] [--repo OWNER/REPO]"
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.TASKFILE_DIR}}" run python "{{.TASKFILE_DIR}}/scripts/release_publish.py" {{.CLI_ARGS}}
+
+  release:rollback:
+    desc: "State-aware release unwind (#716) -- task release:rollback -- <version> [--dry-run] [--allow-low-downloads N] [--allow-data-loss] [--force-strict-0]"
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.TASKFILE_DIR}}" run python "{{.TASKFILE_DIR}}/scripts/release_rollback.py" {{.CLI_ARGS}}
+
+  release:e2e:
+    desc: "End-to-end release rehearsal against an auto-created+destroyed temp repo (#716) -- task release:e2e [-- --dry-run] [--owner OWNER] [--keep-repo]"
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.TASKFILE_DIR}}" run python "{{.TASKFILE_DIR}}/scripts/release_e2e.py" {{.CLI_ARGS}}
+
+  # ------------------------------------------------------------------
+  # Triage v1 user-facing alias tasks (#845, #913).
+  #
+  # The four triage fragments are namespaced under their unique include
+  # keys (`triage-cache`, `triage-actions`, `triage-bulk`,
+  # `triage-bootstrap`) -- a single shared `triage:` include namespace
+  # is not supported by go-task v3 (two includes cannot share a key).
+  # The aliases below provide the documented `task triage:<verb>`
+  # user-facing surface that vBRIEFs / UPGRADING.md / scripts/triage_*.py
+  # describe. Each alias delegates to the underlying namespaced task
+  # and forwards `{{.CLI_ARGS}}` so flags (`--repo`, `--reason`, etc.)
+  # reach the script. The inner tasks in each fragment are
+  # `internal: true` so the fragment-namespace forms
+  # (`triage-cache:cache`, `triage-actions:accept`, `triage-bulk:bulk-defer`,
+  # `triage-bootstrap:bootstrap`) drop out of `task -l`; only the
+  # documented `triage:*` aliases below appear in the listing. The
+  # internal tasks remain CALLABLE for legacy invocations (e.g. recap
+  # text in `scripts/triage_bootstrap.py` still prints the namespaced
+  # forms, which continue to dispatch correctly via the fragment
+  # include).
+  #
+  # Aliases are inline at the root Taskfile rather than in a separate
+  # fragment because they cross include namespaces and must exist
+  # regardless of which fragments are present.
+  #
+  # Mirrors the established #718 release-pipeline flatten precedent
+  # (release: tasks defined inline at the root Taskfile so go-task
+  # does not double-prefix them).
+  # ------------------------------------------------------------------
+  # task triage:cache and task triage:show were removed in #883 Story 3.
+  # The unified cache:* surface (cache:fetch-all, cache:get) is the
+  # canonical replacement; see UPGRADING.md for migration text.
+
+  # ------------------------------------------------------------------
+  # N10 (#1150): bare-invocation `task triage` / `task scope` print a
+  # categorized verb list grouped by role (Session-start, State verbs,
+  # Read verbs, Lifecycle, Subscription mutation, Archive-rotation /
+  # Promote-demote, Activate-complete, Reversibility, Decomposition).
+  # The registry + renderer live in scripts/triage_help.py so every
+  # verb is documented in one place. Each existing `triage:X` /
+  # `scope:X` alias forwards `--help` to the same registry via the
+  # `intercept_help` shim called from each verb script's `main()`.
+  #
+  # Defined at the root Taskfile (not in a fragment) because the bare
+  # target shares the `triage:` / `scope:` prefix with the documented
+  # alias surface and must coexist with `triage:accept`,
+  # `scope:promote`, etc. go-task v3 treats `triage` and `triage:accept`
+  # as distinct task names; the same precedent established by `release`
+  # + `release:publish` in this file (see #718 root-cause rationale).
+  # ------------------------------------------------------------------
+  triage:
+    desc: "Print the categorized triage verb list (#1150 / N10). Run `task triage:<verb> --help` for usage examples."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.TASKFILE_DIR}}" run python -m scripts.triage_help triage
+
+  scope:
+    desc: "Print the categorized scope verb list (#1150 / N10). Run `task scope:<verb> --help` for usage examples."
+    dir: '{{.USER_WORKING_DIR}}'
+    env:
+      PYTHONUTF8: "1"
+    cmds:
+      - uv --project "{{.TASKFILE_DIR}}" run python -m scripts.triage_help scope
+
+  triage:accept:
+    desc: "Accept an issue for triage. Records an audit entry. (#845 Story 3)"
+    cmds:
+      - task: triage-actions:accept
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:reject:
+    desc: "Reject an issue. Closes upstream via gh + applies triage-rejected label; rolls audit back on gh failure. (#845 Story 3)"
+    cmds:
+      - task: triage-actions:reject
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:defer:
+    desc: "Defer an issue. Records an audit entry. (#845 Story 3)"
+    cmds:
+      - task: triage-actions:defer
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:needs-ac:
+    desc: "Mark an issue as needing acceptance criteria + post AC-request comment upstream. (#845 Story 3)"
+    cmds:
+      - task: triage-actions:needs-ac
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:mark-duplicate:
+    desc: "Link an issue as a duplicate of another (validated against Story 1 cache). (#845 Story 3)"
+    cmds:
+      - task: triage-actions:mark-duplicate
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:status:
+    desc: "Print the latest triage decision for an issue. Read-only. (#845 Story 3)"
+    cmds:
+      - task: triage-actions:status
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:reset:
+    desc: "Reset an issue's triage state. Appends a reset audit entry referencing prior; does NOT delete history. (#845 Story 3)"
+    cmds:
+      - task: triage-actions:reset
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:history:
+    desc: "Print the full triage timeline for an issue, ordered by timestamp. Read-only. (#845 Story 3)"
+    cmds:
+      - task: triage-actions:history
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:bulk-accept:
+    desc: "Bulk accept cached candidates -- task triage:bulk-accept -- --repo OWNER/NAME [--label L] [--author A] [--age-days N] [--cluster C] [--re-action] (#845 Story 4 / #915)"
+    cmds:
+      - task: triage-bulk:bulk-accept
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:bulk-reject:
+    desc: "Bulk reject cached candidates -- task triage:bulk-reject -- --repo OWNER/NAME --reason 'why' [--label L] [--author A] [--age-days N] [--cluster C] [--re-action] (#845 Story 4 / #915)"
+    cmds:
+      - task: triage-bulk:bulk-reject
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:bulk-defer:
+    desc: "Bulk defer cached candidates -- task triage:bulk-defer -- --repo OWNER/NAME [--label L] [--author A] [--age-days N] [--cluster C] [--re-action] (#845 Story 4 / #915)"
+    cmds:
+      - task: triage-bulk:bulk-defer
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:bulk-needs-ac:
+    desc: "Bulk needs-ac cached candidates -- task triage:bulk-needs-ac -- --repo OWNER/NAME [--label L] [--author A] [--age-days N] [--cluster C] [--re-action] (#845 Story 4 / #915)"
+    cmds:
+      - task: triage-bulk:bulk-needs-ac
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:refresh-active:
+    desc: "Pre-swarm freshness gate (#845 Story 4) -- detects drift between cached and live `gh issue view` for every issue referenced in vbrief/active/*.vbrief.json"
+    cmds:
+      - task: triage-bulk:refresh-active
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:bootstrap:
+    desc: "Run the triage v1 idempotent installer (#845 Story 6)."
+    cmds:
+      - task: triage-bootstrap:bootstrap
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:reconcile:
+    desc: "Self-heal the triage audit log (#1468): backfill missing `accept` decisions for proposed/pending/active vBRIEFs carrying an x-vbrief/github-issue reference, without a cache re-fetch. Idempotent. -- task triage:reconcile [-- --repo OWNER/NAME] [--dry-run] [--json]"
+    cmds:
+      - task: triage-reconcile:reconcile
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:scope:
+    desc: "Inspect / mutate / diff the typed plan.policy.triageScope[] subscription + triageScopeIgnores[] (#1131 / D12, #1133 / D14, #1182 / D14c). -- task triage:scope -- [--list] [--add-label=L | --add-milestone=M | --ignore-label=L] [--diff-from-upstream --repo OWNER/NAME] [--refresh-denominator --repo OWNER/NAME --count N]"
+    cmds:
+      - task: triage-scope:scope
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:scope-drift:
+    desc: "Detect subscription drift (#1133 / D14): unsubscribed labels/milestones on cached open issues. -- task triage:scope-drift [-- --ignore-label=L | --ignore-milestone=M]"
+    cmds:
+      - task: triage-scope-drift:scope-drift
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:subscribe:
+    desc: "Subscribe to a label / milestone / issue (#1133 / D14). -- task triage:subscribe -- (--label=L | --milestone=M | --issue=N)"
+    cmds:
+      - task: triage-subscribe:subscribe
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:unsubscribe:
+    desc: "Unsubscribe a label / milestone / issue (#1133 / D14). -- task triage:unsubscribe -- (--label=L | --milestone=M | --issue=N)"
+    cmds:
+      - task: triage-subscribe:unsubscribe
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:classify:
+    desc: "Inspect / validate the auto-classification surface (#1129 / D10). -- task triage:classify -- [--list | --validate]"
+    cmds:
+      - task: triage-classify:classify
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:summary:
+    desc: "Emit the one-line triage state for the session-start ritual (D2 / #1122). Always exits 0; appends a JSONL record to vbrief/.eval/summary-history.jsonl. -- task triage:summary -- [--json] [--no-history]"
+    cmds:
+      - task: triage-summary:summary
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:queue:
+    desc: "Print the ranked triage queue (#1128 / D11). -- task triage:queue [-- --repo OWNER/NAME] [--limit N]"
+    cmds:
+      - task: triage-queue:queue
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:show:
+    desc: "Per-issue triage detail (#1128 / D11). -- task triage:show -- <N> [--repo OWNER/NAME]"
+    cmds:
+      - task: triage-queue:show
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:audit:
+    desc: "Audit-log surface (#1128 / D11, #1180). -- task triage:audit [-- --format=text|json] [--vbrief-staleness] [--since=<window>] [--action=<verb>] [--repo OWNER/NAME]"
+    cmds:
+      - task: triage-queue:audit
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  triage:welcome:
+    desc: "Run the 6-phase onboarding ritual (N3 / #1143): detect prior state, prompt subscription scope, run triage:bootstrap, prompt wipCap, offer WIP relief, print triage:summary. Idempotent. -- task triage:welcome [-- --no-subprocess]"
+    cmds:
+      - task: triage-welcome:welcome
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+          DEFT_TASK_PREFIX:
+            sh: |
+              task_name='{{.TASK}}'
+              suffix='triage:welcome'
+              prefix="${task_name%$suffix}"
+              if [ "$prefix" = "$task_name" ]; then
+                prefix=''
+              fi
+              printf '%s' "$prefix"
+
+  triage:smoketest:
+    desc: "Run the N6 (#1146) end-to-end smoketest against the hermetic 20-issue fixture; exits 0 on PASS / 1 on first failure. -- task triage:smoketest [-- --verbose] [--keep-tempdir] [--cache-only]"
+    cmds:
+      - task: triage-smoketest:smoketest
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  # D15 (#1134): scope:undo audit-log reversibility verb. Delegates to
+  # the standalone fragment include `scope-undo`. Reverses a single
+  # audit entry by decision_id or every entry tagged with batch_id;
+  # terminal actions (`complete` / `fail`) are REFUSED.
+  scope:undo:
+    desc: "Reverse a scope-lifecycle audit entry (#1134 / D15). -- task scope:undo -- <decision_id> | --decision-id=<uuid> | --batch-id=<uuid> [--dry-run]"
+    cmds:
+      - task: scope-undo:undo
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  # N7 (#1147): slice:record-existing backfill verb. Retrofits a
+  # vbrief/.eval/slices.jsonl entry for hand-filed umbrella cohorts that
+  # D13's writer (#1132) never saw because they were filed via
+  # `gh issue create` / `issue_write` MCP rather than via a slicing
+  # skill. Companion `slice:list` exposes the read surface.
+  slice:record-existing:
+    desc: "Retrofit a slices.jsonl entry for a hand-filed cohort (#1147 / N7). -- task slice:record-existing -- --umbrella=N --children=A,B,C [--wave-1=A,B] [--wave-2=C] [--actor=manual:operator] [--expected-close-signal=all-children-merged] [--sliced-at=ISO] [--notes=TEXT] [--dry-run] [--force] [--skip-validation] [--repo OWNER/NAME]"
+    cmds:
+      - task: slice-record:record-existing
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
+
+  slice:list:
+    desc: "List recorded slices in vbrief/.eval/slices.jsonl (#1147 / N7). -- task slice:list [-- --json]"
+    cmds:
+      - task: slice-record:list
+        vars:
+          CLI_ARGS: "{{.CLI_ARGS}}"
