@@ -59,6 +59,10 @@ class GameState:
     enemy_spawn_timer: float = 0.0
     ai_restart_timer: float = 0.0
     ai_bout_number: int = 0
+    ai_prev_living_count: int = 0
+    ai_pending_boss_bout: bool = False
+    ai_boss_bout_active: bool = False
+    ai_boss_bout_cooldown: int = 0
     powerup_spawn_timer: float = 0.0
     screen_flash: float = 0.0
     next_ship_id: int = 1
@@ -130,6 +134,10 @@ class GameState:
         self.phase = Phase.PLAYING
         self.wave = 0
         self.ai_bout_number = 1
+        self.ai_prev_living_count = 0
+        self.ai_pending_boss_bout = False
+        self.ai_boss_bout_active = False
+        self.ai_boss_bout_cooldown = 0
         self.score = 0
         self.kills = 0
         self.projectiles.clear()
@@ -242,6 +250,8 @@ class GameState:
                 self.arena.resolve_obstacle_collision(ship)
             if ship.alive and ship.thrust_power and vec_len(ship.velocity) > 10:
                 self.particles.emit_trail(ship.position, ship.angle, ship.color)
+                if vec_len(ship.velocity) > 55:
+                    self.particles.emit_trail(ship.position, ship.angle, ship.color)
 
         # Projectiles
         for proj in self.projectiles:
@@ -254,6 +264,8 @@ class GameState:
                 self.pending_sounds.append("hit")
             else:
                 proj.position = wrap_position(new_pos, rect)
+            if proj.alive and vec_len(proj.velocity) > 80:
+                self.particles.emit_projectile_trail(proj.position, proj.color)
         self.projectiles = [p for p in self.projectiles if p.alive]
 
         for proj in self.projectiles[:]:
@@ -364,7 +376,7 @@ class GameState:
 
     def _on_ship_destroyed(self, ship: Ship) -> None:
         self.particles.emit_explosion(ship.position)
-        self.screen_flash = 0.15
+        self.screen_flash = config.SCREEN_FLASH_DURATION
         self.pending_sounds.append("explosion")
         if self.mode == GameMode.AI_ARENA and self.arena:
             ship.champion_wins = 0
@@ -423,6 +435,42 @@ class GameState:
         extra = min(champion_wins, 3) * config.CHAMPION_BOUT_INVULN_PER_WIN
         return config.CHAMPION_BOUT_INVULN + extra
 
+    def _spawn_boss_bout(self) -> None:
+        """Easter egg: two evolved bosses after a mutual final-two kill."""
+        if self.arena is None:
+            return
+        x, y, w, h = self.arena.rect
+        cx, cy = x + w * 0.5, y + h * 0.5
+        offset = min(w, h) * 0.22
+        self.projectiles.clear()
+        self.pending_sounds.clear()
+        self.all_ships = []
+        self.ai_controllers.clear()
+        variants = [ShipVariant.HEAVY, ShipVariant.HEAVY]
+        positions = [(cx - offset, cy), (cx + offset, cy)]
+        angles = [0.0, 3.14159265]
+        for variant, pos, angle in zip(variants, positions, angles, strict=True):
+            ship = Ship.create(
+                variant,
+                pos,
+                angle=angle,
+                ship_id=self._next_id(),
+                enemy_color=pick_enemy_color(),
+            )
+            ship.ai_controlled = True
+            ship.champion_wins = config.CHAMPION_BOSS_WINS
+            ship.is_boss_evolved = True
+            ship.apply_champion_bonuses()
+            ship.health = ship.max_health
+            ship.spawn_invuln = config.CHAMPION_BOUT_INVULN
+            self.all_ships.append(ship)
+            self.ai_controllers[ship.ship_id] = AIController.for_ship(ship)
+        self.enemies = self.all_ships
+        self.ai_boss_bout_active = True
+        self.ai_boss_bout_cooldown = config.BOSS_BOUT_COOLDOWN_BOUTS
+        self.screen_flash = config.BOSS_BOUT_FLASH
+        self.pending_sounds.append("boss_pulse")
+
     def _respawn_ai_opponents(self) -> None:
         if self.arena is None:
             return
@@ -453,17 +501,23 @@ class GameState:
                 self.powerups.append(PowerUp(PowerUpKind.SHIELD, champ.position))
         self.all_ships = living
         self.enemies = self.all_ships
+        self.ai_boss_bout_active = False
 
     def _update_ai_arena(self, dt: float) -> None:
         if self.ai_restart_timer > 0:
             self.ai_restart_timer = max(0.0, self.ai_restart_timer - dt)
             if self.ai_restart_timer <= 0:
-                self._respawn_ai_opponents()
+                if self.ai_pending_boss_bout:
+                    self._spawn_boss_bout()
+                    self.ai_pending_boss_bout = False
+                else:
+                    self._respawn_ai_opponents()
                 self._spawn_bout_powerups()
             return
 
         living = self.living_ships()
         if len(living) <= 1 and any(not s.alive for s in self.all_ships):
+            double_ko = len(living) == 0 and self.ai_prev_living_count == 2
             self.all_ships = living
             self.enemies = self.all_ships
             self.ai_controllers = {
@@ -478,7 +532,21 @@ class GameState:
                 winner.apply_champion_bonuses()
             self._heal_ships(living)
             self.ai_bout_number += 1
-            self.ai_restart_timer = config.AI_ARENA_RESTART_DELAY
+            if (
+                double_ko
+                and not self.ai_boss_bout_active
+                and self.ai_boss_bout_cooldown <= 0
+            ):
+                self.ai_pending_boss_bout = True
+                self.ai_restart_timer = config.BOSS_BOUT_RESTART_DELAY
+            else:
+                if self.ai_boss_bout_cooldown > 0:
+                    self.ai_boss_bout_cooldown -= 1
+                self.ai_restart_timer = config.AI_ARENA_RESTART_DELAY
+            self.ai_prev_living_count = len(living)
+            return
+
+        self.ai_prev_living_count = len(living)
 
     def toggle_ai_arena(self) -> GameMode:
         if self.mode == GameMode.HUMAN:

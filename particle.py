@@ -32,9 +32,18 @@ class ParticleSystem:
         self.particles: list[Particle] = []
 
     def emit_trail(self, pos: Vec2, angle: float, color: tuple[int, int, int]) -> None:
-        vel = vec_from_angle(angle + 3.14159, random.uniform(20, 60))
+        vel = vec_from_angle(angle + 3.14159, random.uniform(28, 72))
+        tint = tuple(min(255, int(c * 0.85 + 30)) for c in color)
         self.particles.append(
-            Particle(pos, vel, color, 0.35, 0.35, size=1.5)
+            Particle(pos, vel, tint, 0.55, 0.55, size=2.2)
+        )
+
+    def emit_projectile_trail(self, pos: Vec2, color: tuple[int, int, int]) -> None:
+        if random.random() > 0.55:
+            return
+        tint = tuple(min(255, int(c * 0.9 + 20)) for c in color)
+        self.particles.append(
+            Particle(pos, (0.0, 0.0), tint, 0.22, 0.22, size=1.6)
         )
 
     def emit_hit(self, pos: Vec2, color: tuple[int, int, int]) -> None:

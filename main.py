@@ -23,6 +23,7 @@ BG = (0, 0, 0)
 TEXT = (220, 220, 230)
 ACCENT = (80, 200, 255)
 MENU_BG = (8, 8, 14)
+SETTINGS_ROWS = ("sfx", "music", "work", "borderless")
 
 
 def _poly_centroid(points: list[tuple[int, int]]) -> tuple[float, float]:
@@ -44,6 +45,71 @@ def _shrink_poly(
     ]
 
 
+_NEBULA_PUFF_BLOBS = (
+    (0.0, 0.0, 0.44, 1.0),
+    (0.2, -0.14, 0.3, 0.68),
+    (-0.24, 0.16, 0.26, 0.58),
+    (0.1, 0.22, 0.2, 0.45),
+    (-0.12, -0.2, 0.17, 0.38),
+    (0.28, 0.08, 0.13, 0.3),
+    (-0.06, 0.05, 0.11, 0.25),
+)
+
+
+_HULL_GRAY = (70, 72, 76)
+_HULL_GRAY_DARK = (48, 50, 54)
+_HULL_GRAY_INNER = (38, 40, 44)
+_HULL_GRAY_RIM = (112, 115, 120)
+_HULL_GRAY_PANEL = (88, 90, 94)
+
+
+def _ship_paint(ship) -> dict[str, tuple[int, ...]]:
+    """Grayscale hull with faction color reserved for highlights."""
+    accent = ship.color
+    if ship.is_player:
+        accent = (90, 195, 255)
+    canopy = tuple(min(255, int(c * 0.82 + 28)) for c in accent)
+    exhaust = tuple(max(0, int(c * 0.62)) for c in accent)
+    return {
+        "fill": _HULL_GRAY,
+        "aux_fill": _HULL_GRAY_DARK,
+        "inner_fill": _HULL_GRAY_INNER,
+        "highlight": accent,
+        "outline": _HULL_GRAY_RIM,
+        "rim": _HULL_GRAY_RIM,
+        "panel": _HULL_GRAY_PANEL,
+        "canopy": canopy,
+        "exhaust": exhaust,
+        "nozzle": _HULL_GRAY_DARK,
+        "nose_line": accent,
+        "glow_col": tuple(max(0, int(c * 0.22)) for c in accent),
+        "gleam": tuple(min(255, int(c * 0.35 + 70)) for c in accent),
+        "hi_edge": tuple(min(255, int(c * 0.9 + 18)) for c in accent),
+    }
+
+
+def _nebula_puff(
+    size: tuple[int, int],
+    color: tuple[int, int, int],
+    alpha: int,
+) -> pygame.Surface:
+    """Soft oblong cloud from overlapping blobs (fractal-ish, not one circle)."""
+    w, h = size
+    surf = pygame.Surface(size, pygame.SRCALPHA)
+    cx, cy = w * 0.5, h * 0.5
+    base = min(w, h)
+    for ox_frac, oy_frac, r_frac, a_mult in _NEBULA_PUFF_BLOBS:
+        radius = max(2, int(base * r_frac))
+        blob_alpha = max(0, min(255, int(alpha * a_mult)))
+        pygame.draw.circle(
+            surf,
+            (*color, blob_alpha),
+            (int(cx + ox_frac * w), int(cy + oy_frac * h)),
+            radius,
+        )
+    return surf
+
+
 class UiState(str, Enum):
     MENU = "menu"
     PLAYING = "playing"
@@ -57,9 +123,10 @@ class VeilApp:
         pygame.mixer.pre_init(44100, -16, 12, 512)
         pygame.init()
         pygame.display.set_caption(config.WINDOW_TITLE)
-        self.screen = pygame.display.set_mode(
-            (config.DEFAULT_WIDTH, config.DEFAULT_HEIGHT), pygame.RESIZABLE
-        )
+        self.settings = GameSettings()
+        self.settings.load()
+        start_size = (self.settings.window_width, self.settings.window_height)
+        self.screen = pygame.display.set_mode(start_size, self._window_flags())
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("consolas", 20)
         self.font_lg = pygame.font.SysFont("consolas", 36)
@@ -70,8 +137,6 @@ class VeilApp:
         self.ui = UiState.MENU
         self.bindings = BindingMap()
         self.bindings.load()
-        self.settings = GameSettings()
-        self.settings.load()
         self.scores = HighScoreTable()
         self.scores.load()
         self.audio = SoundManager()
@@ -83,16 +148,133 @@ class VeilApp:
 
         self.rebind_action: Action | None = None
         self._ctrl_idx = Action.ROTATE_LEFT
-        self._ctrl_volume_row: str | None = None
+        self._ctrl_settings_row: str | None = None
 
         self.menu_selection = 1  # 0=light, 1=balanced, 2=heavy, 3=ai arena, 4=quit
         self.pause_selection = 0
         self.game_over_timer = 0.0
         self._game_over_saved = False
+        self._vignette_size: tuple[int, int] | None = None
+        self._vignette_surface: pygame.Surface | None = None
+        self._nebula_puff_size: tuple[int, int] | None = None
+        self._nebula_puffs: list[pygame.Surface] = []
+        self._borderless_resize: str | None = None
+        self._borderless_resize_anchor: tuple[int, int, int, int] | None = None
+        self._borderless_cursor: str | None = None
+
+    def _window_flags(self) -> int:
+        flags = pygame.RESIZABLE
+        if self.settings.borderless_window:
+            flags |= pygame.NOFRAME
+        return flags
+
+    def _apply_display_mode(self, size: tuple[int, int] | None = None) -> None:
+        if size is None:
+            size = self.screen.get_size()
+        self.screen = pygame.display.set_mode(size, self._window_flags())
+        self.state.arena = Arena.from_window(*size)
+        self.settings.remember_window_size(*size)
+        self._vignette_size = None
+        self._vignette_surface = None
+        self._nebula_puff_size = None
+        self._nebula_puffs = []
+
+    def _ensure_nebula_puffs(self, sw: int, sh: int) -> list[pygame.Surface]:
+        if self._nebula_puff_size == (sw, sh) and self._nebula_puffs:
+            return self._nebula_puffs
+        base = int(max(sw, sh) * 0.34)
+        self._nebula_puffs = [
+            _nebula_puff((int(base * 1.45), int(base * 0.52)), (14, 18, 30), 11),
+            _nebula_puff((int(base * 0.82), int(base * 0.68)), (16, 20, 32), 10),
+            _nebula_puff((int(base * 1.2), int(base * 0.42)), (12, 16, 28), 9),
+        ]
+        self._nebula_puff_size = (sw, sh)
+        return self._nebula_puffs
 
     def resize(self, size: tuple[int, int]) -> None:
-        self.screen = pygame.display.set_mode(size, pygame.RESIZABLE)
-        self.state.arena = Arena.from_window(*size)
+        self._apply_display_mode(size)
+
+    def _clamp_window_size(self, width: int, height: int) -> tuple[int, int]:
+        return (
+            max(config.WINDOW_MIN_WIDTH, min(config.WINDOW_MAX_WIDTH, int(width))),
+            max(config.WINDOW_MIN_HEIGHT, min(config.WINDOW_MAX_HEIGHT, int(height))),
+        )
+
+    def _set_window_size(self, width: int, height: int) -> None:
+        size = self._clamp_window_size(width, height)
+        if size != self.screen.get_size():
+            self._apply_display_mode(size)
+
+    def _nudge_window_size(self, delta_w: int, delta_h: int) -> None:
+        w, h = self.settings.adjust_window_size(delta_w, delta_h)
+        self._set_window_size(w, h)
+
+    def _borderless_resize_zone(self, pos: tuple[int, int]) -> str | None:
+        if not self.settings.borderless_window:
+            return None
+        w, h = self.screen.get_size()
+        x, y = pos
+        margin = config.BORDERLESS_RESIZE_MARGIN
+        on_right = x >= w - margin
+        on_bottom = y >= h - margin
+        if on_right and on_bottom:
+            return "br"
+        if on_right:
+            return "r"
+        if on_bottom:
+            return "b"
+        return None
+
+    def _handle_borderless_resize_event(self, event: pygame.event.Event) -> bool:
+        if not self.settings.borderless_window:
+            return False
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            zone = self._borderless_resize_zone(event.pos)
+            if zone is None:
+                return False
+            sw, sh = self.screen.get_size()
+            self._borderless_resize = zone
+            self._borderless_resize_anchor = (event.pos[0], event.pos[1], sw, sh)
+            return True
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            if self._borderless_resize is not None:
+                self._borderless_resize = None
+                self._borderless_resize_anchor = None
+                return True
+            return False
+        if event.type == pygame.MOUSEMOTION and self._borderless_resize:
+            anchor = self._borderless_resize_anchor
+            if anchor is None:
+                return False
+            start_x, start_y, start_w, start_h = anchor
+            mx, my = event.pos
+            new_w, new_h = start_w, start_h
+            if "r" in self._borderless_resize:
+                new_w = start_w + (mx - start_x)
+            if "b" in self._borderless_resize:
+                new_h = start_h + (my - start_y)
+            self._set_window_size(new_w, new_h)
+            return True
+        return False
+
+    def _update_borderless_cursor(self) -> None:
+        if not self.settings.borderless_window:
+            cursor_key = "arrow"
+        else:
+            zone = self._borderless_resize or self._borderless_resize_zone(
+                pygame.mouse.get_pos()
+            )
+            cursor_key = zone or "arrow"
+        if cursor_key == self._borderless_cursor:
+            return
+        cursors = {
+            "arrow": pygame.SYSTEM_CURSOR_ARROW,
+            "r": pygame.SYSTEM_CURSOR_SIZEWE,
+            "b": pygame.SYSTEM_CURSOR_SIZENS,
+            "br": pygame.SYSTEM_CURSOR_SIZENWSE,
+        }
+        pygame.mouse.set_system_cursor(cursors[cursor_key])
+        self._borderless_cursor = cursor_key
 
     def run(self) -> None:
         running = True
@@ -104,11 +286,14 @@ class VeilApp:
                     running = False
                 elif event.type == pygame.VIDEORESIZE:
                     self.resize(event.size)
+                elif self._handle_borderless_resize_event(event):
+                    pass
                 else:
                     self.handle_event(event)
 
             self.update(dt)
             self.draw()
+            self._update_borderless_cursor()
         pygame.quit()
 
     def handle_event(self, event: pygame.event.Event) -> None:
@@ -187,7 +372,7 @@ class VeilApp:
         elif choice == "controls":
             self._set_ui(UiState.CONTROLS)
             self.rebind_action = None
-            self._ctrl_volume_row = None
+            self._ctrl_settings_row = None
             self._ctrl_idx = Action.ROTATE_LEFT
         elif choice == "ai_arena":
             self.state.toggle_ai_arena()
@@ -207,47 +392,65 @@ class VeilApp:
                 self.audio.play("ui")
                 return
             if self.rebind_action is None:
-                if event.key in (pygame.K_UP, pygame.K_w):
-                    if self._ctrl_volume_row == "music":
-                        self._ctrl_volume_row = "sfx"
-                    elif self._ctrl_volume_row is None:
-                        idx = list(Action).index(self._ctrl_idx)
-                        if idx == 0:
-                            self._ctrl_volume_row = "music"
-                        else:
-                            self._ctrl_idx = list(Action)[idx - 1]
-                elif event.key in (pygame.K_DOWN, pygame.K_s):
-                    if self._ctrl_volume_row == "sfx":
-                        self._ctrl_volume_row = "music"
-                    elif self._ctrl_volume_row == "music":
-                        self._ctrl_volume_row = None
-                        self._ctrl_idx = list(Action)[0]
-                    else:
-                        idx = list(Action).index(self._ctrl_idx)
-                        if idx < len(Action) - 1:
-                            self._ctrl_idx = list(Action)[idx + 1]
-                elif event.key in (pygame.K_LEFT, pygame.K_a):
-                    if self._ctrl_volume_row == "sfx":
+                if event.key in (pygame.K_LEFT, pygame.K_a):
+                    if self._ctrl_settings_row == "sfx":
                         self.settings.adjust_sfx_volume(-config.VOLUME_STEP)
                         self.audio.sfx_volume = self.settings.sfx_volume
                         self.audio.play("ui")
-                    elif self._ctrl_volume_row == "music":
+                    elif self._ctrl_settings_row == "music":
                         self.settings.adjust_music_volume(-config.VOLUME_STEP)
                         self.music.set_volume(self.settings.music_volume)
                         self._sync_music()
                         self.audio.play("ui")
+                    elif (
+                        self._ctrl_settings_row == "borderless"
+                        and self.settings.borderless_window
+                    ):
+                        self._nudge_window_size(-config.WINDOW_SIZE_STEP, 0)
+                        self.audio.play("ui")
                 elif event.key in (pygame.K_RIGHT, pygame.K_d):
-                    if self._ctrl_volume_row == "sfx":
+                    if self._ctrl_settings_row == "sfx":
                         self.settings.adjust_sfx_volume(config.VOLUME_STEP)
                         self.audio.sfx_volume = self.settings.sfx_volume
                         self.audio.play("ui")
-                    elif self._ctrl_volume_row == "music":
+                    elif self._ctrl_settings_row == "music":
                         self.settings.adjust_music_volume(config.VOLUME_STEP)
                         self.music.set_volume(self.settings.music_volume)
                         self._sync_music()
                         self.audio.play("ui")
+                    elif (
+                        self._ctrl_settings_row == "borderless"
+                        and self.settings.borderless_window
+                    ):
+                        self._nudge_window_size(config.WINDOW_SIZE_STEP, 0)
+                        self.audio.play("ui")
+                elif event.key in (pygame.K_UP, pygame.K_w):
+                    if (
+                        self._ctrl_settings_row == "borderless"
+                        and self.settings.borderless_window
+                    ):
+                        self._nudge_window_size(0, config.WINDOW_SIZE_STEP)
+                        self.audio.play("ui")
+                    else:
+                        self._controls_nav_up()
+                elif event.key in (pygame.K_DOWN, pygame.K_s):
+                    if (
+                        self._ctrl_settings_row == "borderless"
+                        and self.settings.borderless_window
+                    ):
+                        self._nudge_window_size(0, -config.WINDOW_SIZE_STEP)
+                        self.audio.play("ui")
+                    else:
+                        self._controls_nav_down()
                 elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
-                    if self._ctrl_volume_row is None:
+                    if self._ctrl_settings_row == "work":
+                        self.settings.toggle_work_mode()
+                        self.audio.play("ui")
+                    elif self._ctrl_settings_row == "borderless":
+                        self.settings.toggle_borderless()
+                        self._apply_display_mode()
+                        self.audio.play("ui")
+                    elif self._ctrl_settings_row is None:
                         self.rebind_action = self._ctrl_idx
             return
         binding = self.bindings.binding_from_event(event)
@@ -257,6 +460,32 @@ class VeilApp:
                 self.bindings.save()
                 self.audio.play("ui")
             self.rebind_action = None
+
+    def _controls_nav_up(self) -> None:
+        if self._ctrl_settings_row is None:
+            idx = list(Action).index(self._ctrl_idx)
+            if idx == 0:
+                self._ctrl_settings_row = SETTINGS_ROWS[-1]
+            else:
+                self._ctrl_idx = list(Action)[idx - 1]
+            return
+        row_idx = SETTINGS_ROWS.index(self._ctrl_settings_row)
+        if row_idx == 0:
+            return
+        self._ctrl_settings_row = SETTINGS_ROWS[row_idx - 1]
+
+    def _controls_nav_down(self) -> None:
+        if self._ctrl_settings_row is None:
+            idx = list(Action).index(self._ctrl_idx)
+            if idx < len(Action) - 1:
+                self._ctrl_idx = list(Action)[idx + 1]
+            return
+        row_idx = SETTINGS_ROWS.index(self._ctrl_settings_row)
+        if row_idx >= len(SETTINGS_ROWS) - 1:
+            self._ctrl_settings_row = None
+            self._ctrl_idx = list(Action)[0]
+            return
+        self._ctrl_settings_row = SETTINGS_ROWS[row_idx + 1]
 
     def _return_to_menu(self) -> None:
         self._set_ui(UiState.MENU)
@@ -338,16 +567,26 @@ class VeilApp:
         if self.ui == UiState.MENU:
             self._draw_menu()
         elif self.ui == UiState.GAME_OVER:
-            self._draw_game()
-            self._draw_game_over()
+            self._draw_game_glow()
+            self._draw_bloom()
+            self._draw_game_entities()
+            if not self.settings.work_mode:
+                self._draw_game_over()
+            else:
+                self._draw_game_over_minimal()
         elif self.ui == UiState.PAUSED:
-            self._draw_game()
+            self._draw_game_glow()
+            self._draw_bloom()
+            self._draw_game_entities()
             self._draw_pause_menu()
         elif self.ui == UiState.CONTROLS:
             self._draw_controls()
         else:
-            self._draw_game()
-            self._draw_hud()
+            self._draw_game_glow()
+            self._draw_bloom()
+            self._draw_game_entities()
+            if not self.settings.work_mode:
+                self._draw_hud()
 
         pygame.display.flip()
 
@@ -356,6 +595,48 @@ class VeilApp:
         if not arena:
             return
         x, y, aw, ah = (int(v) for v in arena.rect)
+        sw, sh = self.screen.get_size()
+        drift_t = pygame.time.get_ticks() * 0.001
+        amp = config.NEBULA_DRIFT_AMP
+        for puff, (nx, ny, drift_rate, phase, stretch_x, stretch_y) in zip(
+            self._ensure_nebula_puffs(sw, sh),
+            (
+                (0.34, 0.4, 1.0, 0.0, 1.08, 0.94),
+                (0.66, 0.58, 1.32, 2.3, 0.92, 1.12),
+                (0.5, 0.74, 0.86, 4.2, 1.14, 0.88),
+            ),
+            strict=True,
+        ):
+            t = drift_t * config.NEBULA_DRIFT_RATE * drift_rate + phase
+            cx = int(
+                nx * sw
+                + math.sin(t) * sw * amp
+                + math.sin(t * 1.55 + 0.9) * sw * amp * 0.42
+            )
+            cy = int(
+                ny * sh
+                + math.cos(t * 0.78) * sh * amp * 0.9
+                + math.cos(t * 1.25 + 0.5) * sh * amp * 0.38
+            )
+            pulse = 1.0 + 0.06 * math.sin(t * 0.62 + phase)
+            pw, ph = puff.get_size()
+            draw_w = max(8, int(pw * stretch_x * pulse))
+            draw_h = max(8, int(ph * stretch_y / pulse))
+            scaled = pygame.transform.smoothscale(puff, (draw_w, draw_h))
+            self.screen.blit(scaled, (cx - draw_w // 2, cy - draw_h // 2))
+        twinkle_t = drift_t
+        for sx, sy, base, phase, speed, amp in arena.stars:
+            bright = base
+            if amp > 0:
+                bright = base + amp * math.sin(twinkle_t * speed + phase)
+                bright = max(0.15, min(1.0, bright))
+            c = int(80 + 120 * bright)
+            self.screen.set_at((int(sx) % sw, int(sy) % sh), (c, c, c))
+
+    def _draw_asteroids(self) -> None:
+        arena = self.state.arena
+        if not arena:
+            return
         import random as _random
 
         for obs in arena.obstacles:
@@ -373,45 +654,63 @@ class VeilApp:
                 ox = cx + rng.randint(-int(obs.radius * 0.45), int(obs.radius * 0.45))
                 oy = cy + rng.randint(-int(obs.radius * 0.45), int(obs.radius * 0.45))
                 pygame.draw.circle(self.screen, (45, 42, 38), (ox, oy), cr)
-        twinkle_t = pygame.time.get_ticks() * 0.001
-        sw, sh = self.screen.get_size()
-        for sx, sy, base, phase, speed, amp in arena.stars:
-            bright = base
-            if amp > 0:
-                bright = base + amp * math.sin(twinkle_t * speed + phase)
-                bright = max(0.15, min(1.0, bright))
-            c = int(80 + 120 * bright)
-            self.screen.set_at((int(sx) % sw, int(sy) % sh), (c, c, c))
 
-    def _draw_game(self) -> None:
-        if self.state.screen_flash > 0:
+    def _draw_game_glow(self) -> None:
+        if self.state.screen_flash > 0 and not self.settings.work_mode:
             flash = pygame.Surface(self.screen.get_size(), pygame.SRCALPHA)
-            alpha = int(80 * self.state.screen_flash / 0.15)
+            t = min(
+                1.0,
+                self.state.screen_flash / config.SCREEN_FLASH_DURATION,
+            )
+            alpha = int(config.SCREEN_FLASH_ALPHA * t)
             flash.fill((255, 255, 255, alpha))
             self.screen.blit(flash, (0, 0))
 
         for p in self.state.particles.particles:
             alpha = int(255 * (p.lifetime / p.max_lifetime))
-            c = (*p.color[:3],)
-            pygame.draw.circle(
-                self.screen, c, (int(p.position[0]), int(p.position[1])), int(p.size)
-            )
-
-        for pu in self.state.powerups:
-            self._draw_powerup(pu)
+            px, py = int(p.position[0]), int(p.position[1])
+            radius = max(1, int(p.size))
+            if radius >= 2:
+                glow = pygame.Surface((radius * 4, radius * 4), pygame.SRCALPHA)
+                cx, cy = radius * 2, radius * 2
+                pygame.draw.circle(
+                    glow,
+                    (*p.color[:3], max(0, min(255, alpha // 2))),
+                    (cx, cy),
+                    radius + 1,
+                )
+                pygame.draw.circle(
+                    glow,
+                    (*p.color[:3], max(0, min(255, alpha))),
+                    (cx, cy),
+                    radius,
+                )
+                self.screen.blit(glow, (px - cx, py - cy))
+            else:
+                pygame.draw.circle(self.screen, p.color[:3], (px, py), radius)
 
         for proj in self.state.projectiles:
+            tail = (
+                int(proj.position[0] - proj.velocity[0] * 0.05),
+                int(proj.position[1] - proj.velocity[1] * 0.05),
+            )
+            head = (int(proj.position[0]), int(proj.position[1]))
+            pygame.draw.line(self.screen, proj.color, tail, head, 3)
             pygame.draw.line(
                 self.screen,
-                proj.color,
-                (int(proj.position[0]), int(proj.position[1])),
+                tuple(min(255, c + 40) for c in proj.color),
                 (
-                    int(proj.position[0] - proj.velocity[0] * 0.03),
-                    int(proj.position[1] - proj.velocity[1] * 0.03),
+                    int(proj.position[0] - proj.velocity[0] * 0.02),
+                    int(proj.position[1] - proj.velocity[1] * 0.02),
                 ),
-                2,
+                head,
+                1,
             )
 
+    def _draw_game_entities(self) -> None:
+        self._draw_asteroids()
+        for pu in self.state.powerups:
+            self._draw_powerup(pu)
         ships = self.state.living_ships()
         if self.state.player and self.state.player.alive and self.state.player not in ships:
             ships = ships + [self.state.player]
@@ -427,7 +726,6 @@ class VeilApp:
                     int(ship.radius + 4),
                     1,
                 )
-            # Health bar
             if ship.max_health > 0:
                 ratio = ship.health / ship.max_health
                 bx = int(ship.position[0] - 15)
@@ -442,19 +740,20 @@ class VeilApp:
 
         x, y = int(pu.position[0]), int(pu.position[1])
         col = POWERUP_COLORS.get(pu.kind, (200, 200, 200))
-        pulse = 1.0 + 0.12 * math.sin(pu.lifetime * 5.0)
-        glow = tuple(max(0, int(c * 0.35)) for c in col)
-        pygame.draw.circle(self.screen, glow, (x, y), int(16 * pulse))
-        pygame.draw.circle(self.screen, col, (x, y), int(11 * pulse), 2)
+        pulse = 1.0 + 0.06 * math.sin(pu.lifetime * 5.0)
+        outer = int(13 * pulse)
+        pygame.draw.circle(self.screen, (28, 30, 36), (x, y), outer + 1)
+        pygame.draw.circle(self.screen, (52, 54, 60), (x, y), outer)
+        pygame.draw.circle(self.screen, col, (x, y), outer, 2)
 
         if pu.kind == PowerUpKind.SHIELD:
             pts = [
                 (x, y - 9), (x + 8, y - 3), (x + 8, y + 5),
                 (x, y + 9), (x - 8, y + 5), (x - 8, y - 3),
             ]
-            fill = tuple(max(0, int(c * 0.4)) for c in col)
+            fill = tuple(max(0, int(c * 0.55)) for c in col)
             pygame.draw.polygon(self.screen, fill, pts, 0)
-            pygame.draw.polygon(self.screen, col, pts, 2)
+            pygame.draw.polygon(self.screen, (240, 245, 255), pts, 1)
             pygame.draw.arc(self.screen, col, (x - 7, y - 8, 14, 14), 0.4, 2.7, 2)
         elif pu.kind == PowerUpKind.FIRE_RATE:
             bolt = [(x - 2, y - 9), (x + 4, y - 1), (x + 1, y - 1), (x + 3, y + 9), (x - 3, y + 1), (x, y + 1)]
@@ -471,25 +770,16 @@ class VeilApp:
         pts = [(int(p[0]), int(p[1])) for p in ship.hull_points()]
         if len(pts) < 3:
             return
-        if ship.is_player:
-            fill = tuple(max(0, c - 30) for c in ship.color)
-            aux_fill = tuple(max(0, c - 55) for c in ship.color)
-            highlight = tuple(min(255, c + 35) for c in ship.color)
-            outline = (180, 230, 255)
-            canopy = (120, 210, 255)
-            exhaust = (60, 180, 255)
-            nozzle = (40, 140, 220)
-            glow_col = (40, 100, 180)
-        else:
-            fill = tuple(max(0, int(c * 0.75)) for c in ship.color)
-            aux_fill = tuple(max(0, int(c * 0.5)) for c in ship.color)
-            highlight = tuple(min(255, int(c * 0.95)) for c in ship.color)
-            outline = tuple(min(255, int(c * 1.1 + 18)) for c in ship.color)
-            canopy = tuple(min(255, int(c * 0.88)) for c in ship.color)
-            exhaust = tuple(max(0, int(c * 0.65)) for c in ship.color)
-            nozzle = tuple(max(0, int(c * 0.42)) for c in ship.color)
-            glow_col = tuple(max(0, int(c * 0.32)) for c in ship.color)
-            nose_line = tuple(min(255, int(c * 1.05 + 35)) for c in ship.color)
+        paint = _ship_paint(ship)
+        fill = paint["fill"]
+        aux_fill = paint["aux_fill"]
+        highlight = paint["highlight"]
+        outline = paint["outline"]
+        canopy = paint["canopy"]
+        exhaust = paint["exhaust"]
+        nozzle = paint["nozzle"]
+        glow_col = paint["glow_col"]
+        nose_line = paint["nose_line"]
         cx, cy = int(ship.position[0]), int(ship.position[1])
         if ship.is_boss_evolved and ship.boss_pulse_flash > 0:
                 progress = 1.0 - ship.boss_pulse_flash / config.BOSS_PULSE_FLASH
@@ -504,8 +794,8 @@ class VeilApp:
                 )
                 self.screen.blit(ring, (cx - ring_r - 2, cy - ring_r - 2))
         glow_surf = pygame.Surface((64, 64), pygame.SRCALPHA)
-        glow_alpha = 70 if ship.is_boss_evolved else 40
-        glow_size = 24 if ship.is_boss_evolved else 18
+        glow_alpha = 45 if ship.is_boss_evolved else 22
+        glow_size = 20 if ship.is_boss_evolved else 14
         pygame.draw.circle(glow_surf, (*glow_col, glow_alpha), (32, 32), glow_size)
         self.screen.blit(glow_surf, (cx - 32, cy - 32))
         shadow = [(int(p[0] + 3), int(p[1] + 3)) for p in pts]
@@ -516,8 +806,7 @@ class VeilApp:
         self.screen.blit(shadow_surf, (0, 0))
         centroid = _poly_centroid(pts)
         rim_pts = _shrink_poly(pts, centroid, 1.04)
-        rim_col = tuple(min(255, int(c * 1.15 + 22)) for c in outline)
-        pygame.draw.polygon(self.screen, rim_col, rim_pts, 1)
+        pygame.draw.polygon(self.screen, paint["rim"], rim_pts, 1)
         for aux in ship.aux_hull_points():
             aux_pts = [(int(p[0]), int(p[1])) for p in aux]
             if len(aux_pts) >= 3:
@@ -525,35 +814,31 @@ class VeilApp:
                 pygame.draw.polygon(self.screen, outline, aux_pts, 1)
         pygame.draw.polygon(self.screen, fill, pts, 0)
         inner_pts = _shrink_poly(pts, centroid, 0.70)
-        inner_fill = tuple(max(0, int(c * 0.42)) for c in fill)
-        pygame.draw.polygon(self.screen, inner_fill, inner_pts, 0)
+        pygame.draw.polygon(self.screen, paint["inner_fill"], inner_pts, 0)
         hi = [(int(p[0]), int(p[1])) for p in ship.highlight_points()]
         if len(hi) >= 3:
             pygame.draw.polygon(self.screen, highlight, hi, 0)
             hi_rim = _shrink_poly(hi, _poly_centroid(hi), 0.88)
-            hi_edge = tuple(min(255, int(c * 1.08 + 18)) for c in highlight)
-            pygame.draw.polygon(self.screen, hi_edge, hi_rim, 1)
+            pygame.draw.polygon(self.screen, paint["hi_edge"], hi_rim, 1)
         pygame.draw.polygon(self.screen, outline, pts, 2)
         gleam_pts = [(p[0] - 1, p[1] - 1) for p in pts]
-        gleam_col = tuple(min(255, int(c * 0.55 + 40)) for c in outline)
-        pygame.draw.polygon(self.screen, gleam_col, gleam_pts, 1)
+        pygame.draw.polygon(self.screen, paint["gleam"], gleam_pts, 1)
         na, nb = ship.nose_line()
-        nose_col = (240, 250, 255) if ship.is_player else nose_line
         pygame.draw.line(
             self.screen,
-            tuple(max(0, int(c * 0.55)) for c in nose_col),
+            tuple(max(0, int(c * 0.45)) for c in nose_line),
             (int(na[0]), int(na[1])),
             (int(nb[0]), int(nb[1])),
             3,
         )
         pygame.draw.line(
             self.screen,
-            nose_col,
+            nose_line,
             (int(na[0]), int(na[1])),
             (int(nb[0]), int(nb[1])),
             1,
         )
-        panel_col = tuple(max(0, int(c * 0.55)) for c in outline)
+        panel_col = paint["panel"]
         for a, b in ship.panel_lines():
             pygame.draw.line(
                 self.screen,
@@ -687,6 +972,39 @@ class VeilApp:
                 )
         return entries
 
+    def _vignette_for_size(self, w: int, h: int) -> pygame.Surface:
+        if self._vignette_surface is not None and self._vignette_size == (w, h):
+            return self._vignette_surface
+        sample_w = max(1, w // 4)
+        sample_h = max(1, h // 4)
+        sample = pygame.Surface((sample_w, sample_h), pygame.SRCALPHA)
+        cx, cy = sample_w * 0.5, sample_h * 0.5
+        max_r = math.hypot(cx, cy)
+        strength = config.VIGNETTE_STRENGTH
+        for y in range(sample_h):
+            for x in range(sample_w):
+                dist = math.hypot(x - cx, y - cy) / max_r
+                alpha = int(strength * min(1.0, dist**2.1))
+                sample.set_at((x, y), (0, 0, 0, alpha))
+        vignette = pygame.transform.smoothscale(sample, (w, h))
+        self._vignette_size = (w, h)
+        self._vignette_surface = vignette
+        return vignette
+
+    def _draw_bloom(self) -> None:
+        w, h = self.screen.get_size()
+        if w < 8 or h < 8:
+            return
+        div = max(2, config.BLOOM_SCALE_DIV)
+        small = pygame.transform.smoothscale(
+            self.screen,
+            (max(1, w // div), max(1, h // div)),
+        )
+        bloomed = pygame.transform.smoothscale(small, (w, h))
+        bloomed.set_alpha(config.BLOOM_ALPHA)
+        self.screen.blit(bloomed, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+        self.screen.blit(self._vignette_for_size(w, h), (0, 0))
+
     def _draw_hud(self) -> None:
         if self.state.mode == GameMode.AI_ARENA:
             entries = self._ai_hud_entries()
@@ -780,40 +1098,62 @@ class VeilApp:
         title = self.font_lg.render("CONTROLS", True, ACCENT)
         self.screen.blit(title, (40, 30))
         hint = self.font_sm.render(
-            "Up/Down select — Left/Right volume — Enter rebind — R restore — Esc back",
+            "Up/Down select — L/R volume — Enter toggle — borderless: drag edges or arrows resize",
             True,
             (140, 140, 150),
         )
         self.screen.blit(hint, (40, 80))
-        vol_selected = self._ctrl_volume_row is not None and not self.rebind_action
+        settings_selected = self._ctrl_settings_row is not None and not self.rebind_action
         self._draw_volume_slider(
             "SFX volume",
             self.settings.sfx_volume,
-            120,
-            vol_selected and self._ctrl_volume_row == "sfx",
+            118,
+            settings_selected and self._ctrl_settings_row == "sfx",
         )
         self._draw_volume_slider(
             "Music volume",
             self.settings.music_volume,
-            152,
-            vol_selected and self._ctrl_volume_row == "music",
+            150,
+            settings_selected and self._ctrl_settings_row == "music",
         )
+        work_label = "ON" if self.settings.work_mode else "OFF"
+        work_color = ACCENT if settings_selected and self._ctrl_settings_row == "work" else TEXT
+        work_prefix = "> " if settings_selected and self._ctrl_settings_row == "work" else "  "
+        work_surf = self.font.render(f"{work_prefix}Work mode: {work_label}", True, work_color)
+        self.screen.blit(work_surf, (60, 182))
+        border_label = "ON" if self.settings.borderless_window else "OFF"
+        border_color = (
+            ACCENT if settings_selected and self._ctrl_settings_row == "borderless" else TEXT
+        )
+        border_prefix = (
+            "> " if settings_selected and self._ctrl_settings_row == "borderless" else "  "
+        )
+        size_note = ""
+        if self.settings.borderless_window:
+            w, h = self.screen.get_size()
+            size_note = f"  {w}×{h}"
+        border_surf = self.font.render(
+            f"{border_prefix}Borderless window: {border_label}{size_note}",
+            True,
+            border_color,
+        )
+        self.screen.blit(border_surf, (60, 214))
         if not self.music.has_tracks():
             note = self.font_sm.render(
                 f"No tracks in {config.MUSIC_DIR}/ — add .mp3 files to enable music",
                 True,
                 (120, 120, 130),
             )
-            self.screen.blit(note, (60, 178))
+            self.screen.blit(note, (60, 244))
         if self.rebind_action:
             msg = self.font.render(
                 f"Press key, mouse button, or wheel for {ACTION_LABELS[self.rebind_action]}...",
                 True,
                 (255, 220, 100),
             )
-            self.screen.blit(msg, (40, 200))
+            self.screen.blit(msg, (40, 268))
         idx = self._ctrl_idx
-        binding_y = 210 if self.music.has_tracks() else 228
+        binding_y = 276
         for i, action in enumerate(Action):
             b = self.bindings.bindings[action]
             color = ACCENT if action == idx and not self.rebind_action else TEXT
@@ -821,6 +1161,15 @@ class VeilApp:
             line = f"{prefix}{ACTION_LABELS[action]}: {b.label}"
             surf = self.font.render(line, True, color)
             self.screen.blit(surf, (60, binding_y + i * 32))
+
+    def _draw_game_over_minimal(self) -> None:
+        overlay = pygame.Surface(self.screen.get_size(), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 140))
+        self.screen.blit(overlay, (0, 0))
+        title = self.font_lg.render("GAME OVER", True, (255, 80, 60))
+        self.screen.blit(title, title.get_rect(center=(self.screen.get_width() // 2, 280)))
+        prompt = self.font.render("Enter / Esc: menu", True, (140, 140, 150))
+        self.screen.blit(prompt, prompt.get_rect(center=(self.screen.get_width() // 2, 340)))
 
     def _draw_game_over(self) -> None:
         overlay = pygame.Surface(self.screen.get_size(), pygame.SRCALPHA)

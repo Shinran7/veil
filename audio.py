@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import array
 import math
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -11,6 +12,11 @@ import config
 
 if TYPE_CHECKING:
     import pygame
+
+
+def _audio_output_enabled() -> bool:
+    """Skip speaker output during pytest; logic/cooldowns still run."""
+    return not os.environ.get("PYTEST_CURRENT_TEST")
 
 
 def _make_tone(
@@ -122,8 +128,9 @@ class SoundManager:
         sound = self._sounds.get(name)
         if sound is None:
             return False
-        sound.set_volume(self.sfx_volume)  # type: ignore[union-attr]
-        sound.play(0)  # type: ignore[union-attr]  # 0 = play once; -1 loops forever
+        if _audio_output_enabled():
+            sound.set_volume(self.sfx_volume)  # type: ignore[union-attr]
+            sound.play(0)  # type: ignore[union-attr]  # 0 = play once; -1 loops forever
         self._cooldowns[name] = interval
         return True
 
@@ -269,8 +276,9 @@ class MusicManager:
             return
         track = self._tracks[self._track_index]
         sound = self._sounds[track]
-        self._channel.set_volume(self.music_volume)  # type: ignore[union-attr]
-        self._channel.play(sound, loops=0)  # type: ignore[union-attr]
+        if _audio_output_enabled():
+            self._channel.set_volume(self.music_volume)  # type: ignore[union-attr]
+            self._channel.play(sound, loops=0)  # type: ignore[union-attr]
         self._elapsed = 0.0
         self._fade_triggered = False
         self._phase = "playing"

@@ -214,59 +214,39 @@ class Arena:
     def _drift_speed(self) -> float:
         return random.uniform(config.ASTEROID_DRIFT_MIN, config.ASTEROID_DRIFT_MAX)
 
-    def _spawn_asteroid_in_field(self) -> Obstacle:
-        x, y, w, h = self.rect
-        radius = random.uniform(28, 48)
-        for _ in range(24):
-            cx = random.uniform(x + radius, x + w - radius)
-            cy = random.uniform(y + radius, y + h - radius)
-            candidate = Obstacle.create(cx, cy, radius)
-            if all(
-                vec_len(vec_sub(candidate.center, other.center))
-                >= candidate.collision_radius + other.collision_radius + 18
-                for other in self.obstacles
-            ):
-                speed = self._drift_speed()
-                angle = random.uniform(0, 2 * math.pi)
-                candidate.velocity = (
-                    math.cos(angle) * speed,
-                    math.sin(angle) * speed,
-                )
-                return candidate
-        speed = self._drift_speed()
-        angle = random.uniform(0, 2 * math.pi)
-        vel = (math.cos(angle) * speed, math.sin(angle) * speed)
-        return Obstacle.create(cx, cy, radius, velocity=vel)
-
     def _spawn_asteroid_from_edge(self) -> Obstacle:
         x, y, w, h = self.rect
+        mid = (x + w * 0.5, y + h * 0.5)
         radius = random.uniform(28, 48)
         speed = self._drift_speed()
         edge = random.randint(0, 3)
-        jitter = random.uniform(-10, 10)
+        margin = radius + 16
         if edge == 0:
-            cx, cy = x - radius - 12, random.uniform(y + radius, y + h - radius)
-            vel = (speed, jitter)
+            cx = x - margin
+            cy = random.uniform(y + radius, y + h - radius)
         elif edge == 1:
-            cx, cy = x + w + radius + 12, random.uniform(y + radius, y + h - radius)
-            vel = (-speed, jitter)
+            cx = x + w + margin
+            cy = random.uniform(y + radius, y + h - radius)
         elif edge == 2:
-            cx, cy = random.uniform(x + radius, x + w - radius), y - radius - 12
-            vel = (jitter, speed)
+            cx = random.uniform(x + radius, x + w - radius)
+            cy = y - margin
         else:
-            cx, cy = random.uniform(x + radius, x + w - radius), y + h + radius + 12
-            vel = (jitter, -speed)
+            cx = random.uniform(x + radius, x + w - radius)
+            cy = y + h + margin
+        toward = vec_norm(vec_sub(mid, (cx, cy)))
+        aim = math.atan2(toward[1], toward[0]) + random.uniform(-0.4, 0.4)
+        vel = (math.cos(aim) * speed, math.sin(aim) * speed)
         return Obstacle.create(cx, cy, radius, velocity=vel)
 
     def init_asteroid_field(self, count: int | None = None) -> None:
-        """Seed 2–4 drifting asteroids on screen; persists across waves."""
+        """Seed drifting asteroids just off-screen; they roll in from the edges."""
         self.obstacles.clear()
         if count is not None:
             total = count
         else:
             total = random.randint(config.ASTEROID_MIN_COUNT, config.ASTEROID_MAX_COUNT)
         for _ in range(total):
-            self.obstacles.append(self._spawn_asteroid_in_field())
+            self.obstacles.append(self._spawn_asteroid_from_edge())
         self._asteroid_spawn_cooldown = random.uniform(1.0, 3.0)
 
     def _try_spawn_asteroid(self) -> None:
@@ -326,7 +306,7 @@ class Arena:
         self.obstacles = [o for o in self.obstacles if not o.is_off_screen(self.rect)]
 
         while len(self.obstacles) < config.ASTEROID_MIN_COUNT:
-            self.obstacles.append(self._spawn_asteroid_in_field())
+            self.obstacles.append(self._spawn_asteroid_from_edge())
             self._asteroid_spawn_cooldown = random.uniform(1.0, 2.5)
         self.resolve_obstacle_collisions()
 

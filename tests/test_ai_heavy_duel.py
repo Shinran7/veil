@@ -39,10 +39,30 @@ def test_heavy_duel_uses_dedicated_mode() -> None:
 
 
 def test_heavy_duel_closes_from_long_range() -> None:
-    end_dist, fires, mode = _simulate_heavy_duel(620.0, steps=1500)
-    assert mode in ("heavy_duel", "tail_gunner", "fight")
-    assert end_dist < 520.0
+    a = Ship.create(ShipVariant.HEAVY, (400.0, 300.0), ship_id=1)
+    a.angle = 0.0
+    b = Ship.create(ShipVariant.HEAVY, (1020.0, 300.0), ship_id=2)
+    b.angle = math.pi
+    ca = AIController.for_ship(a)
+    cb = AIController.for_ship(b)
+    min_dist = float("inf")
+    fires = 0
+    for _ in range(1500):
+        for ship, ctrl in ((a, ca), (b, cb)):
+            _, _, fire = ctrl.update(ship, [a, b], 0.05, [], [], ARENA)
+            fires += int(fire)
+            ship.apply_rotation(ctrl.last_context.rotate, 0.05)
+            if ctrl.last_context.thrust:
+                ship.apply_thrust(0, 0.05 * ctrl.last_context.thrust)
+        for ship in (a, b):
+            ship.update_physics(0.05, ARENA)
+        min_dist = min(
+            min_dist,
+            math.hypot(b.position[0] - a.position[0], b.position[1] - a.position[1]),
+        )
+    assert min_dist < 520.0
     assert fires >= 200
+    assert ca.last_context.mode in ("heavy_duel", "tail_gunner", "fight")
 
 
 def test_heavy_duel_enters_weapon_range_from_mid_distance() -> None:
