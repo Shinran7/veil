@@ -62,14 +62,16 @@ def test_pick_tactic_prefers_tail_over_fight() -> None:
     assert any(s.tactic == TacticId.TAIL_GUNNER and s.score > 0 for s in resolution.scores)
 
 
-def test_cover_scores_when_los_blocked_near_rock() -> None:
+def test_cover_hide_scores_when_los_blocked_near_rock() -> None:
     ship = Ship.create(ShipVariant.BALANCED, (100.0, 200.0), ship_id=1)
     target = Ship.create(ShipVariant.LIGHT, (500.0, 200.0), ship_id=2)
     wall = Obstacle.blocking_at(300.0, 200.0, 45.0)
     survivor = AIController(profile=ARCHETYPE_PROFILES[PilotArchetype.SURVIVOR])
     ctx = _base_ctx(ship, target, has_los=False, obstacles=[wall])
-    cover_score = survivor._score_cover(ctx)
-    assert cover_score >= 0.55
+    obs = survivor._best_cover_obstacle(ship, target, [wall])
+    assert obs is not None
+    hide_score = survivor._score_cover_hide(ctx, obs)
+    assert hide_score >= 0.55
 
 
 def test_active_tactic_on_situation_matches_context_mode() -> None:

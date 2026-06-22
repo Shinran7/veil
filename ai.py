@@ -202,7 +202,14 @@ class CombatSituation:
     solo_dogfight: bool
     center_bias_scale: float
     cover: bool = False
+    cover_phase: str | None = None
     active_tactic: str = "fight"
+
+
+class CoverPhase(str, Enum):
+    HIDE = "hide"
+    AMBUSH = "ambush"
+    PEEK = "peek"
 
 
 class TacticId(str, Enum):
@@ -214,7 +221,9 @@ class TacticId(str, Enum):
     PANIC = "panic"
     KITE = "kite"
     HEAVY_DUEL = "heavy_duel"
-    COVER = "cover"
+    COVER_PEEK = "cover_peek"
+    COVER_AMBUSH = "cover_ambush"
+    COVER_HIDE = "cover_hide"
     FIGHT = "fight"
 
 
@@ -231,9 +240,11 @@ TACTIC_PRIORITY: tuple[TacticId, ...] = (
     TacticId.REVERSE_GUN,
     TacticId.POWERUP,
     TacticId.PANIC,
+    TacticId.COVER_PEEK,
     TacticId.KITE,
     TacticId.HEAVY_DUEL,
-    TacticId.COVER,
+    TacticId.COVER_AMBUSH,
+    TacticId.COVER_HIDE,
     TacticId.FIGHT,
 )
 
@@ -279,6 +290,7 @@ class TacticResolution:
     reverse_gun: bool
     reverse_eligible: bool
     cover: bool
+    cover_phase: CoverPhase | None
     kiting: bool
     snap_shot: bool
     panic_snap: bool
@@ -351,6 +363,10 @@ class AIController:
         self.last_situation: CombatSituation | None = None
         self.last_active_tactic = TacticId.FIGHT
         self.last_tactic_scores: tuple[TacticScore, ...] = ()
+        self.cover_ambush_timer = 0.0
+        self.cover_peek_timer = 0.0
+        self.cover_peek_cooldown = 0.0
+        self.locked_cover_center: Vec2 | None = None
 
     @classmethod
     def for_ship(cls, ship: Ship) -> AIController:
@@ -992,6 +1008,137 @@ class AIController:
             perp = (-perp[1], perp[0])
         return target.position
 
+    def _obstacle_blocks_segment(
+        self, start: Vec2, end: Vec2, obs, clearance: float = 12.0
+    ) -> bool:
+        return segment_circle_intersect(
+            start,
+            end,
+            obs.center,
+            obs.collision_radius + clearance,
+        )
+
+    def _best_cover_obstacle(
+        self, ship: Ship, target: Ship, obstacles: list
+    ):
+        best = None
+        best_score = -1.0
+        for obs in obstacles:
+            dist_s = vec_len(vec_sub(ship.position, obs.center))
+            if dist_s > config.AI_COVER_HIDE_MAX_DIST:
+                continue
+            blocks = self._obstacle_blocks_segment(
+                target.position, ship.position, obs
+            )
+            score = 1.0 - dist_s / config.AI_COVER_HIDE_MAX_DIST
+            if blocks:
+                score += 0.45
+            if self._ship_in_cover(ship, target, obs):
+                score += 0.25
+            if score > best_score:
+                best_score = score
+                best = obs
+        return best
+
+    def _ship_in_cover(self, ship: Ship, target: Ship, obs) -> bool:
+        if not self._obstacle_blocks_segment(
+            target.position, ship.position, obs, clearance=14.0
+        ):
+            return False
+        dist = vec_len(vec_sub(ship.position, obs.center))
+        return dist < obs.collision_radius + ship.radius + 85.0
+
+    def _cover_shadow_point(self, ship: Ship, target: Ship, obs) -> Vec2:
+        away = vec_norm(vec_sub(obs.center, target.position))
+        return vec_add(
+            obs.center,
+            vec_scale(away, obs.collision_radius + config.AI_COVER_SHADOW_OFFSET),
+        )
+
+    def _cover_peek_lateral(self, ship: Ship, target: Ship, sign: float) -> Vec2:
+        rel = vec_sub(target.position, ship.position)
+        dist = max(vec_len(rel), 1.0)
+        perp = (-rel[1] / dist * sign, rel[0] / dist * sign)
+        lane = config.AI_COVER_PEEK_LANE_OFFSET
+        return (
+            ship.position[0] + perp[0] * lane,
+            ship.position[1] + perp[1] * lane,
+        )
+
+    def _cover_peek_point(self, ship: Ship, target: Ship, obs, obstacles: list) -> Vec2:
+        for sign in (self.flank_sign, -self.flank_sign):
+            candidate = self._cover_peek_lateral(ship, target, sign)
+            if not self._path_blocked(
+                candidate, target.position, obstacles, clearance=8.0
+            ):
+                return candidate
+        return self._cover_shadow_point(ship, target, obs)
+
+    def _cover_peek_lane_clear(
+        self, ship: Ship, target: Ship, obs, obstacles: list
+    ) -> bool:
+        del obs
+        for sign in (self.flank_sign, -self.flank_sign):
+            origin = self._cover_peek_lateral(ship, target, sign)
+            if not self._path_blocked(
+                origin, target.position, obstacles, clearance=8.0
+            ):
+                return True
+        return False
+
+    def _cover_aim_for_phase(
+        self,
+        ship: Ship,
+        target: Ship,
+        obs,
+        phase: CoverPhase,
+        obstacles: list,
+    ) -> Vec2:
+        if phase == CoverPhase.PEEK:
+            return self._cover_peek_point(ship, target, obs, obstacles)
+        if phase == CoverPhase.AMBUSH:
+            hide = self._cover_shadow_point(ship, target, obs)
+            return (
+                ship.position[0] * 0.55 + hide[0] * 0.45,
+                ship.position[1] * 0.55 + hide[1] * 0.45,
+            )
+        hide = self._cover_shadow_point(ship, target, obs)
+        if not self._path_blocked(ship.position, hide, obstacles, clearance=10.0):
+            return hide
+        return self._flank_point(ship, target, obstacles)
+
+    def _update_cover_state(self, ctx: TacticEvalContext):
+        dt = ctx.dt
+        if self.cover_peek_cooldown > 0:
+            self.cover_peek_cooldown = max(0.0, self.cover_peek_cooldown - dt)
+        if self.cover_peek_timer > 0:
+            self.cover_peek_timer = max(0.0, self.cover_peek_timer - dt)
+            if self.cover_peek_timer <= 0:
+                self.cover_peek_cooldown = config.AI_COVER_PEEK_COOLDOWN
+        obs = self._best_cover_obstacle(ctx.ship, ctx.target, ctx.obstacles)
+        if obs is None:
+            self.cover_ambush_timer = max(0.0, self.cover_ambush_timer - dt * 0.5)
+            self.locked_cover_center = None
+            return None
+        in_cover = self._ship_in_cover(ctx.ship, ctx.target, obs)
+        if in_cover and ctx.closing > config.AI_COVER_AMBUSH_CLOSING:
+            self.cover_ambush_timer += dt
+        else:
+            self.cover_ambush_timer = max(0.0, self.cover_ambush_timer - dt * 0.5)
+        if (
+            in_cover
+            and self.cover_ambush_timer >= config.AI_COVER_AMBUSH_WAIT
+            and self.cover_peek_timer <= 0
+            and self.cover_peek_cooldown <= 0
+            and self._cover_peek_lane_clear(
+                ctx.ship, ctx.target, obs, ctx.obstacles
+            )
+            and ctx.target_bearing < 0.62
+        ):
+            self.cover_peek_timer = config.AI_COVER_PEEK_COMMIT
+        self.locked_cover_center = obs.center
+        return obs
+
     def _avoidance_vector(self, ship: Ship, obstacles: list) -> Vec2:
         push = (0.0, 0.0)
         for obs in obstacles:
@@ -1367,23 +1514,61 @@ class AIController:
             return 0.0
         return 0.68 * prof.heavy_commit
 
-    def _score_cover(self, ctx: TacticEvalContext) -> float:
+    def _score_cover_hide(self, ctx: TacticEvalContext, obs) -> float:
+        prof = self.profile
+        if ctx.shield_ramming or ctx.seeking_powerup or obs is None:
+            return 0.0
+        if self._ship_in_cover(ctx.ship, ctx.target, obs):
+            return 0.0
+        dist_obs = vec_len(vec_sub(ctx.ship.position, obs.center))
+        if dist_obs > config.AI_COVER_HIDE_MAX_DIST:
+            return 0.0
+        pressured = (
+            not ctx.has_los
+            or ctx.caution >= config.AI_COVER_HIDE_CAUTION
+            or ctx.ship.health < ctx.ship.max_health * 0.52
+        )
+        if not pressured and prof.cover_seek < 1.1:
+            return 0.0
+        fit = 0.48 + (1.0 - dist_obs / config.AI_COVER_HIDE_MAX_DIST) * 0.38
+        if not ctx.has_los:
+            fit += 0.14
+        return fit * prof.cover_seek
+
+    def _score_cover_ambush(self, ctx: TacticEvalContext, obs) -> float:
         prof = self.profile
         if (
             ctx.shield_ramming
             or ctx.seeking_powerup
-            or ctx.has_los
-            or not ctx.obstacles
+            or obs is None
+            or self.cover_peek_timer > 0
         ):
             return 0.0
-        nearest = float("inf")
-        for obs in ctx.obstacles:
-            rel = vec_sub(obs.center, ctx.ship.position)
-            nearest = min(nearest, vec_len(rel))
-        if nearest > 220.0:
+        if not self._ship_in_cover(ctx.ship, ctx.target, obs):
             return 0.0
-        cover_fit = 0.5 + (1.0 - min(1.0, nearest / 220.0)) * 0.35
-        return cover_fit * prof.cover_seek
+        if ctx.closing <= config.AI_COVER_AMBUSH_CLOSING:
+            return 0.0
+        fit = 0.58 + min(0.28, ctx.closing / 140.0)
+        if ctx.caution >= 0.25:
+            fit += 0.08
+        return fit * prof.cover_seek
+
+    def _score_cover_peek(self, ctx: TacticEvalContext, obs) -> float:
+        prof = self.profile
+        if (
+            ctx.shield_ramming
+            or ctx.seeking_powerup
+            or obs is None
+            or self.cover_peek_timer <= 0
+        ):
+            return 0.0
+        if not self._ship_in_cover(ctx.ship, ctx.target, obs):
+            return 0.0
+        if not self._cover_peek_lane_clear(
+            ctx.ship, ctx.target, obs, ctx.obstacles
+        ):
+            return 0.0
+        return 0.86 * prof.cover_seek
 
     def _update_reverse_gun_state(
         self, ctx: TacticEvalContext, reverse_eligible: bool
@@ -1443,6 +1628,7 @@ class AIController:
             and not ctx.seeking_powerup
         )
         reverse_gun = self._update_reverse_gun_state(ctx, reverse_eligible)
+        cover_obs = self._update_cover_state(ctx)
 
         panicking = ctx.panicking
         panic_pull = ctx.panic_pull
@@ -1458,7 +1644,9 @@ class AIController:
             TacticId.PANIC: self._score_panic(ctx),
             TacticId.KITE: self._score_kite(ctx),
             TacticId.HEAVY_DUEL: self._score_heavy_duel(ctx),
-            TacticId.COVER: self._score_cover(ctx),
+            TacticId.COVER_PEEK: self._score_cover_peek(ctx, cover_obs),
+            TacticId.COVER_AMBUSH: self._score_cover_ambush(ctx, cover_obs),
+            TacticId.COVER_HIDE: self._score_cover_hide(ctx, cover_obs),
             TacticId.FIGHT: 0.38,
         }
         active = self._pick_tactic(raw_scores)
@@ -1471,7 +1659,17 @@ class AIController:
         tail_gunner = active == TacticId.TAIL_GUNNER
         six_evade = active == TacticId.SIX_EVADE
         reverse_gun = active == TacticId.REVERSE_GUN
-        cover = active == TacticId.COVER
+        cover_hide = active == TacticId.COVER_HIDE
+        cover_ambush = active == TacticId.COVER_AMBUSH
+        cover_peek = active == TacticId.COVER_PEEK
+        cover = cover_hide or cover_ambush or cover_peek
+        cover_phase: CoverPhase | None = None
+        if cover_peek:
+            cover_phase = CoverPhase.PEEK
+        elif cover_ambush:
+            cover_phase = CoverPhase.AMBUSH
+        elif cover_hide:
+            cover_phase = CoverPhase.HIDE
         kiting = active == TacticId.KITE
         heavy_duel = active == TacticId.HEAVY_DUEL
 
@@ -1542,6 +1740,7 @@ class AIController:
             reverse_gun=reverse_gun,
             reverse_eligible=reverse_eligible,
             cover=cover,
+            cover_phase=cover_phase,
             kiting=kiting,
             snap_shot=snap_shot,
             panic_snap=panic_snap,
@@ -1685,6 +1884,7 @@ class AIController:
         reverse_gun = tactics.reverse_gun
         reverse_eligible = tactics.reverse_eligible
         cover = tactics.cover
+        cover_phase = tactics.cover_phase
         kiting = tactics.kiting
         snap_shot = tactics.snap_shot
         panic_snap = tactics.panic_snap
@@ -1733,6 +1933,7 @@ class AIController:
             solo_dogfight=solo_dogfight,
             center_bias_scale=center_bias_scale,
             cover=cover,
+            cover_phase=cover_phase.value if cover_phase else None,
             active_tactic=tactics.active.value,
         )
 
@@ -1788,6 +1989,9 @@ class AIController:
         six_evade = sit.six_evade
         reverse_gun = sit.reverse_gun
         cover = sit.cover
+        cover_phase = (
+            CoverPhase(sit.cover_phase) if sit.cover_phase else None
+        )
         kiting = sit.kiting
         snap_shot = sit.snap_shot
         reengage = sit.reengage
@@ -1826,8 +2030,14 @@ class AIController:
             aim_pos = self.lead_target(ship, target, arena_rect)
         elif kiting:
             aim_pos = self._kite_point(ship, target, dist, obs)
-        elif cover:
-            aim_pos = self._flank_point(ship, target, obs)
+        elif cover and cover_phase is not None:
+            cover_obs = self._best_cover_obstacle(ship, target, obs)
+            if cover_obs is not None:
+                aim_pos = self._cover_aim_for_phase(
+                    ship, target, cover_obs, cover_phase, obs
+                )
+            else:
+                aim_pos = self._flank_point(ship, target, obs)
         elif heavy_duel and self.heavy_duel_commit_timer > 0:
             aim_pos = self._predict_target_position(target, 0.32, ship.variant)
         else:
@@ -1846,6 +2056,7 @@ class AIController:
             and not reverse_gun
             and not shield_ramming
             and not seeking_powerup
+            and not cover
         ):
             aim_pos = self._flank_point(ship, target, obs)
 
@@ -2004,6 +2215,15 @@ class AIController:
         elif reverse_gun:
             thrust = self._reverse_gun_thrust(ship, self.reverse_gun_commit_timer)
             strafe = self.flank_sign * 0.08
+        elif cover and cover_phase == CoverPhase.PEEK:
+            thrust = 0.44
+            strafe = self.flank_sign * 0.58
+        elif cover and cover_phase == CoverPhase.AMBUSH:
+            thrust = 0.14
+            strafe = self.flank_sign * 0.1
+        elif cover and cover_phase == CoverPhase.HIDE:
+            thrust = 0.74
+            strafe = self.flank_sign * 0.28
         elif tail_gunner:
             ideal = self._ideal_weapon_range(ship)
             inner = config.AI_RANGE_INNER_TOLERANCE
@@ -2178,6 +2398,18 @@ class AIController:
             if self._in_weapon_sweet_spot(ship, dist):
                 cone = 0.72
             should_fire = should_fire and abs(self._angle_diff(ship.angle, to_target)) < cone
+        elif cover and cover_phase == CoverPhase.PEEK:
+            cover_obs = self._best_cover_obstacle(ship, target, obs)
+            peek_los = (
+                cover_obs is not None
+                and self._cover_peek_lane_clear(ship, target, cover_obs, obs)
+            )
+            should_fire = (
+                peek_los
+                and dist < fire_range
+                and target_bearing < 0.58
+                and abs(self._angle_diff(ship.angle, to_target)) < 0.62
+            )
         elif heavy_duel:
             cone = 0.92 if dist > 360 else 0.78
             should_fire = (
@@ -2277,7 +2509,7 @@ class AIController:
         elif kiting:
             mode = "kite"
         elif cover:
-            mode = "cover"
+            mode = sit.active_tactic
         elif breaking_orbit:
             mode = "orbit_break"
         elif heavy_duel:
