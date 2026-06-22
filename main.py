@@ -5,6 +5,10 @@ from __future__ import annotations
 import math
 import sys
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pygame._sdl2
 
 import pygame
 
@@ -24,6 +28,31 @@ TEXT = (220, 220, 230)
 ACCENT = (80, 200, 255)
 MENU_BG = (8, 8, 14)
 SETTINGS_ROWS = ("sfx", "music", "work", "borderless")
+
+
+def borderless_resize_zone(
+    pos: tuple[int, int], size: tuple[int, int]
+) -> str | None:
+    w, h = size
+    x, y = pos
+    margin = config.BORDERLESS_RESIZE_MARGIN
+    on_right = x >= w - margin
+    on_bottom = y >= h - margin
+    if on_right and on_bottom:
+        return "br"
+    if on_right:
+        return "r"
+    if on_bottom:
+        return "b"
+    return None
+
+
+def borderless_drag_zone(pos: tuple[int, int], size: tuple[int, int]) -> bool:
+    if borderless_resize_zone(pos, size) is not None:
+        return False
+    w, _h = size
+    x, y = pos
+    return y < config.BORDERLESS_DRAG_HEIGHT and x < w - config.BORDERLESS_RESIZE_MARGIN
 
 
 def _poly_centroid(points: list[tuple[int, int]]) -> tuple[float, float]:
@@ -160,7 +189,10 @@ class VeilApp:
         self._nebula_puffs: list[pygame.Surface] = []
         self._borderless_resize: str | None = None
         self._borderless_resize_anchor: tuple[int, int, int, int] | None = None
+        self._borderless_drag: tuple[int, int] | None = None
+        self._borderless_drag_origin: tuple[int, int] | None = None
         self._borderless_cursor: str | None = None
+        self._sdl_window: pygame._sdl2.Window | None = None
 
     def _window_flags(self) -> int:
         flags = pygame.RESIZABLE
@@ -209,39 +241,49 @@ class VeilApp:
         w, h = self.settings.adjust_window_size(delta_w, delta_h)
         self._set_window_size(w, h)
 
+    def _sdl2_window(self) -> "pygame._sdl2.Window":
+        if self._sdl_window is None:
+            import pygame._sdl2 as sdl2
+
+            self._sdl_window = sdl2.Window.from_display_module()
+        return self._sdl_window
+
     def _borderless_resize_zone(self, pos: tuple[int, int]) -> str | None:
         if not self.settings.borderless_window:
             return None
-        w, h = self.screen.get_size()
-        x, y = pos
-        margin = config.BORDERLESS_RESIZE_MARGIN
-        on_right = x >= w - margin
-        on_bottom = y >= h - margin
-        if on_right and on_bottom:
-            return "br"
-        if on_right:
-            return "r"
-        if on_bottom:
-            return "b"
-        return None
+        return borderless_resize_zone(pos, self.screen.get_size())
+
+    def _borderless_drag_zone(self, pos: tuple[int, int]) -> bool:
+        if not self.settings.borderless_window:
+            return False
+        return borderless_drag_zone(pos, self.screen.get_size())
 
     def _handle_borderless_resize_event(self, event: pygame.event.Event) -> bool:
         if not self.settings.borderless_window:
             return False
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             zone = self._borderless_resize_zone(event.pos)
-            if zone is None:
-                return False
-            sw, sh = self.screen.get_size()
-            self._borderless_resize = zone
-            self._borderless_resize_anchor = (event.pos[0], event.pos[1], sw, sh)
-            return True
+            if zone is not None:
+                sw, sh = self.screen.get_size()
+                self._borderless_resize = zone
+                self._borderless_resize_anchor = (event.pos[0], event.pos[1], sw, sh)
+                return True
+            if self._borderless_drag_zone(event.pos):
+                self._borderless_drag = event.pos
+                self._borderless_drag_origin = self._sdl2_window().position
+                return True
+            return False
         if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            handled = False
             if self._borderless_resize is not None:
                 self._borderless_resize = None
                 self._borderless_resize_anchor = None
-                return True
-            return False
+                handled = True
+            if self._borderless_drag is not None:
+                self._borderless_drag = None
+                self._borderless_drag_origin = None
+                handled = True
+            return handled
         if event.type == pygame.MOUSEMOTION and self._borderless_resize:
             anchor = self._borderless_resize_anchor
             if anchor is None:
@@ -255,20 +297,34 @@ class VeilApp:
                 new_h = start_h + (my - start_y)
             self._set_window_size(new_w, new_h)
             return True
+        if event.type == pygame.MOUSEMOTION and self._borderless_drag:
+            origin = self._borderless_drag_origin
+            start = self._borderless_drag
+            if origin is None or start is None:
+                return False
+            dx = event.pos[0] - start[0]
+            dy = event.pos[1] - start[1]
+            self._sdl2_window().position = (origin[0] + dx, origin[1] + dy)
+            return True
         return False
 
     def _update_borderless_cursor(self) -> None:
         if not self.settings.borderless_window:
             cursor_key = "arrow"
         else:
-            zone = self._borderless_resize or self._borderless_resize_zone(
-                pygame.mouse.get_pos()
-            )
-            cursor_key = zone or "arrow"
+            pos = pygame.mouse.get_pos()
+            zone = self._borderless_resize or self._borderless_resize_zone(pos)
+            if zone:
+                cursor_key = zone
+            elif self._borderless_drag or self._borderless_drag_zone(pos):
+                cursor_key = "move"
+            else:
+                cursor_key = "arrow"
         if cursor_key == self._borderless_cursor:
             return
         cursors = {
             "arrow": pygame.SYSTEM_CURSOR_ARROW,
+            "move": pygame.SYSTEM_CURSOR_SIZEALL,
             "r": pygame.SYSTEM_CURSOR_SIZEWE,
             "b": pygame.SYSTEM_CURSOR_SIZENS,
             "br": pygame.SYSTEM_CURSOR_SIZENWSE,
@@ -402,11 +458,7 @@ class VeilApp:
                         self.music.set_volume(self.settings.music_volume)
                         self._sync_music()
                         self.audio.play("ui")
-                    elif (
-                        self._ctrl_settings_row == "borderless"
-                        and self.settings.borderless_window
-                    ):
-                        self._nudge_window_size(-config.WINDOW_SIZE_STEP, 0)
+                    elif self._borderless_shift_resize(event, -config.WINDOW_SIZE_STEP, 0):
                         self.audio.play("ui")
                 elif event.key in (pygame.K_RIGHT, pygame.K_d):
                     if self._ctrl_settings_row == "sfx":
@@ -418,27 +470,15 @@ class VeilApp:
                         self.music.set_volume(self.settings.music_volume)
                         self._sync_music()
                         self.audio.play("ui")
-                    elif (
-                        self._ctrl_settings_row == "borderless"
-                        and self.settings.borderless_window
-                    ):
-                        self._nudge_window_size(config.WINDOW_SIZE_STEP, 0)
+                    elif self._borderless_shift_resize(event, config.WINDOW_SIZE_STEP, 0):
                         self.audio.play("ui")
                 elif event.key in (pygame.K_UP, pygame.K_w):
-                    if (
-                        self._ctrl_settings_row == "borderless"
-                        and self.settings.borderless_window
-                    ):
-                        self._nudge_window_size(0, config.WINDOW_SIZE_STEP)
+                    if self._borderless_shift_resize(event, 0, config.WINDOW_SIZE_STEP):
                         self.audio.play("ui")
                     else:
                         self._controls_nav_up()
                 elif event.key in (pygame.K_DOWN, pygame.K_s):
-                    if (
-                        self._ctrl_settings_row == "borderless"
-                        and self.settings.borderless_window
-                    ):
-                        self._nudge_window_size(0, -config.WINDOW_SIZE_STEP)
+                    if self._borderless_shift_resize(event, 0, -config.WINDOW_SIZE_STEP):
                         self.audio.play("ui")
                     else:
                         self._controls_nav_down()
@@ -460,6 +500,19 @@ class VeilApp:
                 self.bindings.save()
                 self.audio.play("ui")
             self.rebind_action = None
+
+    def _borderless_shift_resize(
+        self, event: pygame.event.Event, delta_w: int, delta_h: int
+    ) -> bool:
+        shift = bool(event.mod & pygame.KMOD_SHIFT)
+        if (
+            not shift
+            or self._ctrl_settings_row != "borderless"
+            or not self.settings.borderless_window
+        ):
+            return False
+        self._nudge_window_size(delta_w, delta_h)
+        return True
 
     def _controls_nav_up(self) -> None:
         if self._ctrl_settings_row is None:
@@ -1098,7 +1151,7 @@ class VeilApp:
         title = self.font_lg.render("CONTROLS", True, ACCENT)
         self.screen.blit(title, (40, 30))
         hint = self.font_sm.render(
-            "Up/Down select — L/R volume — Enter toggle — borderless: drag edges or arrows resize",
+            "Up/Down select — L/R volume — Enter toggle — borderless: drag top bar to move, edges to resize",
             True,
             (140, 140, 150),
         )
