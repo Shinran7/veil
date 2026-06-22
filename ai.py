@@ -52,6 +52,7 @@ class PilotProfile:
     heavy_commit: float = 1.0
     flank_strafe: float = 1.0
     chase_push: float = 1.0
+    cover_seek: float = 1.0
 
 
 NEUTRAL_PROFILE = PilotProfile(archetype=PilotArchetype.HUNTER)
@@ -73,6 +74,7 @@ ARCHETYPE_PROFILES: dict[PilotArchetype, PilotProfile] = {
         tail_hold=0.82,
         chase_push=0.82,
         powerup_greed=0.9,
+        cover_seek=1.45,
     ),
     PilotArchetype.BRUISER: PilotProfile(
         archetype=PilotArchetype.BRUISER,
@@ -90,6 +92,7 @@ ARCHETYPE_PROFILES: dict[PilotArchetype, PilotProfile] = {
         tail_hold=0.88,
         chase_push=0.95,
         six_evade=1.08,
+        cover_seek=1.18,
     ),
     PilotArchetype.OPPORTUNIST: PilotProfile(
         archetype=PilotArchetype.OPPORTUNIST,
@@ -198,6 +201,93 @@ class CombatSituation:
     heavy_duel: bool
     solo_dogfight: bool
     center_bias_scale: float
+    cover: bool = False
+    active_tactic: str = "fight"
+
+
+class TacticId(str, Enum):
+    SHIELD_RAM = "shield_ram"
+    TAIL_GUNNER = "tail_gunner"
+    SIX_EVADE = "six_evade"
+    REVERSE_GUN = "reverse_gun"
+    POWERUP = "powerup"
+    PANIC = "panic"
+    KITE = "kite"
+    HEAVY_DUEL = "heavy_duel"
+    COVER = "cover"
+    FIGHT = "fight"
+
+
+@dataclass(frozen=True)
+class TacticScore:
+    tactic: TacticId
+    score: float
+
+
+TACTIC_PRIORITY: tuple[TacticId, ...] = (
+    TacticId.SHIELD_RAM,
+    TacticId.TAIL_GUNNER,
+    TacticId.SIX_EVADE,
+    TacticId.REVERSE_GUN,
+    TacticId.POWERUP,
+    TacticId.PANIC,
+    TacticId.KITE,
+    TacticId.HEAVY_DUEL,
+    TacticId.COVER,
+    TacticId.FIGHT,
+)
+
+TACTIC_SCORE_MIN = 0.35
+
+
+@dataclass
+class TacticEvalContext:
+    ship: Ship
+    target: Ship
+    opponents: list[Ship]
+    obstacles: list
+    arena_rect: tuple[float, float, float, float] | None
+    rel_to_target: Vec2
+    dist: float
+    closing: float
+    has_los: bool
+    engage_quality: float
+    behind_target: bool
+    shot_bearing: float
+    misaligned_shot: bool
+    target_bearing: float
+    rear_threat: Ship | None
+    being_tailed: bool
+    rear_dist: float
+    caution: float
+    shield_ramming: bool
+    panic_pull: bool
+    panicking: bool
+    pickup: tuple | None
+    seeking_powerup: bool
+    pickup_bias: float
+    six_close_dist: float
+    dt: float
+
+
+@dataclass
+class TacticResolution:
+    active: TacticId
+    scores: tuple[TacticScore, ...]
+    tail_gunner: bool
+    six_evade: bool
+    reverse_gun: bool
+    reverse_eligible: bool
+    cover: bool
+    kiting: bool
+    snap_shot: bool
+    panic_snap: bool
+    panicking: bool
+    panic_pull: bool
+    reengage: bool
+    heavy_duel: bool
+    solo_dogfight: bool
+    center_bias_scale: float
 
 
 @dataclass
@@ -259,6 +349,8 @@ class AIController:
         self._target_tracks: dict[int, TargetMotionTrack] = {}
         self.last_context = AIDecisionContext()
         self.last_situation: CombatSituation | None = None
+        self.last_active_tactic = TacticId.FIGHT
+        self.last_tactic_scores: tuple[TacticScore, ...] = ()
 
     @classmethod
     def for_ship(cls, ship: Ship) -> AIController:
@@ -1177,6 +1269,290 @@ class AIController:
             ship.position[1] + perp[1] * offset * sign,
         )
 
+    def _pick_tactic(self, scores: dict[TacticId, float]) -> TacticId:
+        for tactic in TACTIC_PRIORITY:
+            if scores.get(tactic, 0.0) >= TACTIC_SCORE_MIN:
+                return tactic
+        return TacticId.FIGHT
+
+    def _score_tail_gunner(self, ctx: TacticEvalContext) -> float:
+        prof = self.profile
+        if (
+            not ctx.behind_target
+            or ctx.seeking_powerup
+            or ctx.shield_ramming
+        ):
+            return 0.0
+        tail_dist_min = config.AI_TAIL_MAINTAIN_DIST_MIN / prof.tail_hold
+        tail_dist_max = config.AI_TAIL_MAINTAIN_DIST_MAX * (
+            0.92 + 0.08 * prof.tail_hold
+        )
+        if not (tail_dist_min < ctx.dist < tail_dist_max):
+            return 0.0
+        if (
+            ctx.ship.health < ctx.ship.max_health * 0.28
+            and VARIANT_TIER[ctx.target.variant] > VARIANT_TIER[ctx.ship.variant]
+        ):
+            return 0.0
+        tail_hold_bearing = config.AI_TAIL_HOLD_BEARING * (
+            1.0 + 0.25 * (prof.tail_hold - 1.0)
+        )
+        tail_hold_engage = config.AI_TAIL_HOLD_ENGAGE / prof.tail_hold
+        fits = (
+            ctx.misaligned_shot
+            or ctx.ship.health < ctx.ship.max_health * 0.52
+            or ctx.shot_bearing < tail_hold_bearing
+            or ctx.engage_quality >= tail_hold_engage
+        )
+        if not fits:
+            return 0.0
+        quality = 0.55
+        if ctx.misaligned_shot:
+            quality += 0.12
+        if ctx.engage_quality >= tail_hold_engage:
+            quality += ctx.engage_quality * 0.25
+        return quality * prof.tail_hold
+
+    def _score_six_evade(self, ctx: TacticEvalContext) -> float:
+        if (
+            not ctx.being_tailed
+            or ctx.rear_threat is None
+            or ctx.rear_dist >= ctx.six_close_dist
+            or ctx.shield_ramming
+            or ctx.seeking_powerup
+        ):
+            return 0.0
+        proximity = 1.0 - min(1.0, ctx.rear_dist / ctx.six_close_dist)
+        return (0.5 + proximity * 0.45) * self.profile.six_evade
+
+    def _score_reverse_gun(
+        self, ctx: TacticEvalContext, reverse_gun: bool, reverse_eligible: bool
+    ) -> float:
+        del ctx, reverse_eligible
+        if reverse_gun:
+            return 0.95 * self.profile.reverse_gun
+        return 0.0
+
+    def _score_powerup(self, ctx: TacticEvalContext) -> float:
+        if not ctx.seeking_powerup or ctx.shield_ramming:
+            return 0.0
+        return 0.82 * self.profile.powerup_greed
+
+    def _score_panic(self, ctx: TacticEvalContext) -> float:
+        if not ctx.panicking or ctx.shield_ramming:
+            return 0.0
+        return 0.72
+
+    def _score_kite(self, ctx: TacticEvalContext) -> float:
+        prof = self.profile
+        if ctx.panicking or ctx.shield_ramming or ctx.seeking_powerup:
+            return 0.0
+        kite_caution_min = 0.28 / max(0.55, prof.kite_retreat)
+        if not (
+            ctx.caution >= kite_caution_min
+            or (ctx.panic_pull and ctx.dist >= 210)
+        ):
+            return 0.0
+        return min(0.88, 0.4 + ctx.caution * 0.5) * prof.kite_retreat
+
+    def _score_heavy_duel(self, ctx: TacticEvalContext) -> float:
+        prof = self.profile
+        if (
+            not self._is_heavy_duel(ctx.ship, ctx.target, ctx.opponents)
+            or ctx.ship.health < ctx.ship.max_health * 0.35
+            or ctx.panicking
+            or ctx.shield_ramming
+            or ctx.seeking_powerup
+        ):
+            return 0.0
+        return 0.68 * prof.heavy_commit
+
+    def _score_cover(self, ctx: TacticEvalContext) -> float:
+        prof = self.profile
+        if (
+            ctx.shield_ramming
+            or ctx.seeking_powerup
+            or ctx.has_los
+            or not ctx.obstacles
+        ):
+            return 0.0
+        nearest = float("inf")
+        for obs in ctx.obstacles:
+            rel = vec_sub(obs.center, ctx.ship.position)
+            nearest = min(nearest, vec_len(rel))
+        if nearest > 220.0:
+            return 0.0
+        cover_fit = 0.5 + (1.0 - min(1.0, nearest / 220.0)) * 0.35
+        return cover_fit * prof.cover_seek
+
+    def _update_reverse_gun_state(
+        self, ctx: TacticEvalContext, reverse_eligible: bool
+    ) -> bool:
+        prof = self.profile
+        dt = ctx.dt
+        reverse_gun = False
+        if self.reverse_gun_cooldown > 0:
+            self.reverse_gun_cooldown = max(0.0, self.reverse_gun_cooldown - dt)
+        if self.reverse_gun_commit_timer > 0:
+            lost_aim = ctx.target_bearing > 1.05
+            if (
+                ctx.dist > config.AI_REVERSE_GUN_ABORT_DIST
+                or lost_aim
+                or not ctx.has_los
+            ):
+                self.reverse_gun_commit_timer = 0.0
+                self.reverse_gun_cooldown = config.AI_REVERSE_GUN_COOLDOWN * 0.5
+            else:
+                reverse_gun = True
+                self.reverse_gun_commit_timer = max(
+                    0.0, self.reverse_gun_commit_timer - dt
+                )
+                if self.reverse_gun_commit_timer <= 0:
+                    self.reverse_gun_cooldown = config.AI_REVERSE_GUN_COOLDOWN
+        elif reverse_eligible:
+            self.reverse_gun_eligible_timer += dt
+            reverse_eligible_after = (
+                config.AI_REVERSE_GUN_ELIGIBLE_AFTER / prof.reverse_gun
+            )
+            if (
+                self.reverse_gun_eligible_timer >= reverse_eligible_after
+                and self.reverse_gun_cooldown <= 0
+            ):
+                reverse_gun = True
+                self.reverse_gun_commit_timer = config.AI_REVERSE_GUN_COMMIT
+                self.reverse_gun_eligible_timer = 0.0
+        else:
+            self.reverse_gun_eligible_timer = max(
+                0.0, self.reverse_gun_eligible_timer - dt * 0.6
+            )
+        return reverse_gun
+
+    def _resolve_tactics(self, ctx: TacticEvalContext) -> TacticResolution:
+        prof = self.profile
+        reverse_eligible = (
+            self._reverse_gun_eligible(
+                ctx.ship,
+                ctx.target,
+                ctx.dist,
+                ctx.rel_to_target,
+                ctx.closing,
+                ctx.behind_target,
+                ctx.has_los,
+            )
+            and not ctx.shield_ramming
+            and not ctx.seeking_powerup
+        )
+        reverse_gun = self._update_reverse_gun_state(ctx, reverse_eligible)
+
+        panicking = ctx.panicking
+        panic_pull = ctx.panic_pull
+
+        raw_scores = {
+            TacticId.SHIELD_RAM: 1.0 if ctx.shield_ramming else 0.0,
+            TacticId.TAIL_GUNNER: self._score_tail_gunner(ctx),
+            TacticId.SIX_EVADE: self._score_six_evade(ctx),
+            TacticId.REVERSE_GUN: self._score_reverse_gun(
+                ctx, reverse_gun, reverse_eligible
+            ),
+            TacticId.POWERUP: self._score_powerup(ctx),
+            TacticId.PANIC: self._score_panic(ctx),
+            TacticId.KITE: self._score_kite(ctx),
+            TacticId.HEAVY_DUEL: self._score_heavy_duel(ctx),
+            TacticId.COVER: self._score_cover(ctx),
+            TacticId.FIGHT: 0.38,
+        }
+        active = self._pick_tactic(raw_scores)
+        score_rows = tuple(
+            TacticScore(tactic=t, score=raw_scores[t]) for t in TACTIC_PRIORITY
+        )
+        self.last_active_tactic = active
+        self.last_tactic_scores = score_rows
+
+        tail_gunner = active == TacticId.TAIL_GUNNER
+        six_evade = active == TacticId.SIX_EVADE
+        reverse_gun = active == TacticId.REVERSE_GUN
+        cover = active == TacticId.COVER
+        kiting = active == TacticId.KITE
+        heavy_duel = active == TacticId.HEAVY_DUEL
+
+        if tail_gunner or six_evade or reverse_gun:
+            panicking = False
+            panic_pull = False
+
+        self.kite_burst_timer -= ctx.dt
+        self.panic_burst_timer -= ctx.dt
+        snap_shot = kiting and self.kite_burst_timer > 0
+        if kiting and self.kite_burst_timer <= 0 and random.random() < 0.022:
+            self.kite_burst_timer = random.uniform(0.45, 0.8)
+        panic_snap = panicking and self.panic_burst_timer > 0
+        if panicking and self.panic_burst_timer <= 0 and random.random() < 0.04:
+            self.panic_burst_timer = random.uniform(0.35, 0.7)
+
+        reengage = (
+            ctx.ship.health < ctx.ship.max_health * 0.42
+            and ctx.dist > 300
+            and ctx.caution < 0.2
+        )
+
+        heavy_eligible = self._score_heavy_duel(ctx) > 0
+        if heavy_eligible and not tail_gunner and not six_evade and not reverse_gun:
+            if abs(ctx.dist - self.last_dist) < 14.0 and abs(ctx.closing) < 35.0:
+                self.heavy_duel_stale_timer += ctx.dt
+            else:
+                self.heavy_duel_stale_timer = max(
+                    0.0, self.heavy_duel_stale_timer - ctx.dt * 0.6
+                )
+            heavy_commit_after = (
+                config.AI_HEAVY_DUEL_COMMIT_AFTER / prof.heavy_commit
+            )
+            if self.heavy_duel_stale_timer >= heavy_commit_after:
+                self.heavy_duel_commit_timer = config.AI_HEAVY_DUEL_COMMIT_DURATION
+                self.heavy_duel_stale_timer = 0.0
+        else:
+            self.heavy_duel_stale_timer = max(
+                0.0, self.heavy_duel_stale_timer - ctx.dt
+            )
+        self.heavy_duel_commit_timer = max(
+            0.0, self.heavy_duel_commit_timer - ctx.dt
+        )
+
+        solo_dogfight = (
+            len(ctx.opponents) == 1
+            and ctx.ship.health >= ctx.ship.max_health * 0.35
+            and 55 < ctx.dist < config.AI_SOLO_DOGFIGHT_MAX_DIST
+            and active not in (
+                TacticId.PANIC,
+                TacticId.SHIELD_RAM,
+                TacticId.POWERUP,
+                TacticId.TAIL_GUNNER,
+                TacticId.SIX_EVADE,
+                TacticId.REVERSE_GUN,
+                TacticId.HEAVY_DUEL,
+            )
+        )
+        center_bias_scale = (
+            config.AI_HEAVY_DUEL_CENTER_BIAS if heavy_duel else 1.0
+        )
+
+        return TacticResolution(
+            active=active,
+            scores=score_rows,
+            tail_gunner=tail_gunner,
+            six_evade=six_evade,
+            reverse_gun=reverse_gun,
+            reverse_eligible=reverse_eligible,
+            cover=cover,
+            kiting=kiting,
+            snap_shot=snap_shot,
+            panic_snap=panic_snap,
+            panicking=panicking,
+            panic_pull=panic_pull,
+            reengage=reengage,
+            heavy_duel=heavy_duel,
+            solo_dogfight=solo_dogfight,
+            center_bias_scale=center_bias_scale,
+        )
+
     def _assess_combat_situation(
         self,
         ship: Ship,
@@ -1275,159 +1651,49 @@ class AIController:
             elif pu_score >= 0.28 and not panicking:
                 pickup_bias = min(0.48, pu_score - 0.08)
 
-        tail_dist_min = config.AI_TAIL_MAINTAIN_DIST_MIN / prof.tail_hold
-        tail_dist_max = config.AI_TAIL_MAINTAIN_DIST_MAX * (
-            0.92 + 0.08 * prof.tail_hold
+        tactic_ctx = TacticEvalContext(
+            ship=ship,
+            target=target,
+            opponents=opponents,
+            obstacles=obstacles,
+            arena_rect=arena_rect,
+            rel_to_target=rel_to_target,
+            dist=dist,
+            closing=closing,
+            has_los=has_los,
+            engage_quality=engage_quality,
+            behind_target=behind_target,
+            shot_bearing=shot_bearing,
+            misaligned_shot=misaligned_shot,
+            target_bearing=target_bearing,
+            rear_threat=rear_threat,
+            being_tailed=being_tailed,
+            rear_dist=rear_dist,
+            caution=caution,
+            shield_ramming=shield_ramming,
+            panic_pull=panic_pull,
+            panicking=panicking,
+            pickup=pickup,
+            seeking_powerup=seeking_powerup,
+            pickup_bias=pickup_bias,
+            six_close_dist=six_close_dist,
+            dt=dt,
         )
-        tail_hold_bearing = config.AI_TAIL_HOLD_BEARING * (
-            1.0 + 0.25 * (prof.tail_hold - 1.0)
-        )
-        tail_hold_engage = config.AI_TAIL_HOLD_ENGAGE / prof.tail_hold
-        tail_gunner = (
-            behind_target
-            and not seeking_powerup
-            and not shield_ramming
-            and tail_dist_min < dist < tail_dist_max
-            and (
-                misaligned_shot
-                or ship.health < ship.max_health * 0.52
-                or shot_bearing < tail_hold_bearing
-                or engage_quality >= tail_hold_engage
-            )
-            and not (
-                ship.health < ship.max_health * 0.28
-                and VARIANT_TIER[target.variant] > VARIANT_TIER[ship.variant]
-            )
-        )
-        six_evade = (
-            being_tailed
-            and rear_threat is not None
-            and rear_dist < six_close_dist
-            and not tail_gunner
-            and not shield_ramming
-            and not seeking_powerup
-        )
-        if tail_gunner:
-            panicking = False
-            panic_pull = False
-        if six_evade:
-            panicking = False
-
-        reverse_eligible = (
-            self._reverse_gun_eligible(
-                ship,
-                target,
-                dist,
-                rel_to_target,
-                closing,
-                behind_target,
-                has_los,
-            )
-            and not shield_ramming
-            and not seeking_powerup
-            and not tail_gunner
-            and not six_evade
-        )
-        reverse_gun = False
-        if self.reverse_gun_cooldown > 0:
-            self.reverse_gun_cooldown = max(0.0, self.reverse_gun_cooldown - dt)
-        if self.reverse_gun_commit_timer > 0:
-            lost_aim = target_bearing > 1.05
-            if dist > config.AI_REVERSE_GUN_ABORT_DIST or lost_aim or not has_los:
-                self.reverse_gun_commit_timer = 0.0
-                self.reverse_gun_cooldown = config.AI_REVERSE_GUN_COOLDOWN * 0.5
-            else:
-                reverse_gun = True
-                self.reverse_gun_commit_timer = max(
-                    0.0, self.reverse_gun_commit_timer - dt
-                )
-                if self.reverse_gun_commit_timer <= 0:
-                    self.reverse_gun_cooldown = config.AI_REVERSE_GUN_COOLDOWN
-        elif reverse_eligible:
-            self.reverse_gun_eligible_timer += dt
-            reverse_eligible_after = (
-                config.AI_REVERSE_GUN_ELIGIBLE_AFTER / prof.reverse_gun
-            )
-            if (
-                self.reverse_gun_eligible_timer >= reverse_eligible_after
-                and self.reverse_gun_cooldown <= 0
-            ):
-                reverse_gun = True
-                self.reverse_gun_commit_timer = config.AI_REVERSE_GUN_COMMIT
-                self.reverse_gun_eligible_timer = 0.0
-        else:
-            self.reverse_gun_eligible_timer = max(
-                0.0, self.reverse_gun_eligible_timer - dt * 0.6
-            )
-
-        if reverse_gun:
-            panicking = False
-        kite_caution_min = 0.28 / max(0.55, prof.kite_retreat)
-        kiting = (
-            (caution >= kite_caution_min or (panic_pull and dist >= 210))
-            and not panicking
-            and not shield_ramming
-            and not tail_gunner
-            and not six_evade
-            and not reverse_gun
-            and not seeking_powerup
-        )
-
-        self.kite_burst_timer -= dt
-        self.panic_burst_timer -= dt
-        snap_shot = kiting and self.kite_burst_timer > 0
-        if kiting and self.kite_burst_timer <= 0 and random.random() < 0.022:
-            self.kite_burst_timer = random.uniform(0.45, 0.8)
-        panic_snap = panicking and self.panic_burst_timer > 0
-        if panicking and self.panic_burst_timer <= 0 and random.random() < 0.04:
-            self.panic_burst_timer = random.uniform(0.35, 0.7)
-        reengage = (
-            ship.health < ship.max_health * 0.42
-            and dist > 300
-            and caution < 0.2
-        )
-        heavy_duel = (
-            self._is_heavy_duel(ship, target, opponents)
-            and ship.health >= ship.max_health * 0.35
-            and not panicking
-            and not shield_ramming
-            and not seeking_powerup
-            and not tail_gunner
-            and not six_evade
-            and not reverse_gun
-        )
-        if heavy_duel:
-            if abs(dist - self.last_dist) < 14.0 and abs(closing) < 35.0:
-                self.heavy_duel_stale_timer += dt
-            else:
-                self.heavy_duel_stale_timer = max(
-                    0.0, self.heavy_duel_stale_timer - dt * 0.6
-                )
-            heavy_commit_after = (
-                config.AI_HEAVY_DUEL_COMMIT_AFTER / prof.heavy_commit
-            )
-            if self.heavy_duel_stale_timer >= heavy_commit_after:
-                self.heavy_duel_commit_timer = config.AI_HEAVY_DUEL_COMMIT_DURATION
-                self.heavy_duel_stale_timer = 0.0
-        else:
-            self.heavy_duel_stale_timer = max(0.0, self.heavy_duel_stale_timer - dt)
-        self.heavy_duel_commit_timer = max(0.0, self.heavy_duel_commit_timer - dt)
-
-        solo_dogfight = (
-            len(opponents) == 1
-            and ship.health >= ship.max_health * 0.35
-            and 55 < dist < config.AI_SOLO_DOGFIGHT_MAX_DIST
-            and not panicking
-            and not shield_ramming
-            and not seeking_powerup
-            and not tail_gunner
-            and not six_evade
-            and not reverse_gun
-            and not heavy_duel
-        )
-        center_bias_scale = (
-            config.AI_HEAVY_DUEL_CENTER_BIAS if heavy_duel else 1.0
-        )
+        tactics = self._resolve_tactics(tactic_ctx)
+        tail_gunner = tactics.tail_gunner
+        six_evade = tactics.six_evade
+        reverse_gun = tactics.reverse_gun
+        reverse_eligible = tactics.reverse_eligible
+        cover = tactics.cover
+        kiting = tactics.kiting
+        snap_shot = tactics.snap_shot
+        panic_snap = tactics.panic_snap
+        panicking = tactics.panicking
+        panic_pull = tactics.panic_pull
+        reengage = tactics.reengage
+        heavy_duel = tactics.heavy_duel
+        solo_dogfight = tactics.solo_dogfight
+        center_bias_scale = tactics.center_bias_scale
         return CombatSituation(
             ship=ship,
             target=target,
@@ -1466,6 +1732,8 @@ class AIController:
             heavy_duel=heavy_duel,
             solo_dogfight=solo_dogfight,
             center_bias_scale=center_bias_scale,
+            cover=cover,
+            active_tactic=tactics.active.value,
         )
 
     def update(
@@ -1519,6 +1787,7 @@ class AIController:
         tail_gunner = sit.tail_gunner
         six_evade = sit.six_evade
         reverse_gun = sit.reverse_gun
+        cover = sit.cover
         kiting = sit.kiting
         snap_shot = sit.snap_shot
         reengage = sit.reengage
@@ -1557,6 +1826,8 @@ class AIController:
             aim_pos = self.lead_target(ship, target, arena_rect)
         elif kiting:
             aim_pos = self._kite_point(ship, target, dist, obs)
+        elif cover:
+            aim_pos = self._flank_point(ship, target, obs)
         elif heavy_duel and self.heavy_duel_commit_timer > 0:
             aim_pos = self._predict_target_position(target, 0.32, ship.variant)
         else:
@@ -2005,6 +2276,8 @@ class AIController:
             mode = "panic"
         elif kiting:
             mode = "kite"
+        elif cover:
+            mode = "cover"
         elif breaking_orbit:
             mode = "orbit_break"
         elif heavy_duel:
