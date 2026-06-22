@@ -1,7 +1,7 @@
 """Reverse gun run — committed astern fire when head-on and closing."""
 
 import config
-from ai import AIController
+from ai import AIController, NEUTRAL_PROFILE
 from ship import Ship, ShipVariant
 
 
@@ -12,7 +12,7 @@ def _head_on_close_setup() -> tuple[Ship, Ship, AIController]:
     charger = Ship.create(ShipVariant.HEAVY, (470.0, 300.0), ship_id=2)
     charger.angle = 3.14159265
     charger.velocity = (-120.0, 0.0)
-    return defender, charger, AIController.for_ship(defender)
+    return defender, charger, AIController(profile=NEUTRAL_PROFILE)
 
 
 def test_reverse_gun_needs_eligibility_window() -> None:

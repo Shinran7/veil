@@ -30,11 +30,116 @@ class Personality(str, Enum):
     FLANKER = "flanker"
 
 
+class PilotArchetype(str, Enum):
+    HUNTER = "hunter"
+    SURVIVOR = "survivor"
+    BRUISER = "bruiser"
+    FLANKER = "flanker"
+    OPPORTUNIST = "opportunist"
+
+
+@dataclass(frozen=True)
+class PilotProfile:
+    """Per-ship tactical tendencies — weights scale tactic eligibility and thrust."""
+
+    archetype: PilotArchetype
+    tail_hold: float = 1.0
+    six_evade: float = 1.0
+    reverse_gun: float = 1.0
+    powerup_greed: float = 1.0
+    risk_tolerance: float = 1.0
+    kite_retreat: float = 1.0
+    heavy_commit: float = 1.0
+    flank_strafe: float = 1.0
+    chase_push: float = 1.0
+
+
+NEUTRAL_PROFILE = PilotProfile(archetype=PilotArchetype.HUNTER)
+
+ARCHETYPE_PROFILES: dict[PilotArchetype, PilotProfile] = {
+    PilotArchetype.HUNTER: PilotProfile(
+        archetype=PilotArchetype.HUNTER,
+        tail_hold=1.45,
+        chase_push=1.2,
+        risk_tolerance=1.15,
+        kite_retreat=0.72,
+        six_evade=0.88,
+    ),
+    PilotArchetype.SURVIVOR: PilotProfile(
+        archetype=PilotArchetype.SURVIVOR,
+        six_evade=1.42,
+        kite_retreat=1.38,
+        risk_tolerance=0.72,
+        tail_hold=0.82,
+        chase_push=0.82,
+        powerup_greed=0.9,
+    ),
+    PilotArchetype.BRUISER: PilotProfile(
+        archetype=PilotArchetype.BRUISER,
+        reverse_gun=1.55,
+        heavy_commit=1.45,
+        chase_push=1.28,
+        risk_tolerance=1.22,
+        tail_hold=1.05,
+        kite_retreat=0.78,
+    ),
+    PilotArchetype.FLANKER: PilotProfile(
+        archetype=PilotArchetype.FLANKER,
+        flank_strafe=1.55,
+        kite_retreat=1.12,
+        tail_hold=0.88,
+        chase_push=0.95,
+        six_evade=1.08,
+    ),
+    PilotArchetype.OPPORTUNIST: PilotProfile(
+        archetype=PilotArchetype.OPPORTUNIST,
+        powerup_greed=1.58,
+        risk_tolerance=0.92,
+        chase_push=0.9,
+        tail_hold=0.92,
+    ),
+}
+
+ARCHETYPE_TO_PERSONALITY = {
+    PilotArchetype.HUNTER: Personality.AGGRESSIVE,
+    PilotArchetype.BRUISER: Personality.AGGRESSIVE,
+    PilotArchetype.OPPORTUNIST: Personality.AGGRESSIVE,
+    PilotArchetype.SURVIVOR: Personality.DEFENSIVE,
+    PilotArchetype.FLANKER: Personality.FLANKER,
+}
+
+VARIANT_ARCHETYPE_POOL: dict[ShipVariant, tuple[PilotArchetype, ...]] = {
+    ShipVariant.LIGHT: (
+        PilotArchetype.HUNTER,
+        PilotArchetype.FLANKER,
+        PilotArchetype.OPPORTUNIST,
+        PilotArchetype.HUNTER,
+    ),
+    ShipVariant.BALANCED: (
+        PilotArchetype.HUNTER,
+        PilotArchetype.BRUISER,
+        PilotArchetype.FLANKER,
+        PilotArchetype.OPPORTUNIST,
+    ),
+    ShipVariant.HEAVY: (
+        PilotArchetype.BRUISER,
+        PilotArchetype.SURVIVOR,
+        PilotArchetype.BRUISER,
+        PilotArchetype.SURVIVOR,
+    ),
+}
+
 PERSONALITY_FOR_VARIANT = {
     ShipVariant.LIGHT: Personality.AGGRESSIVE,
     ShipVariant.BALANCED: Personality.AGGRESSIVE,
     ShipVariant.HEAVY: Personality.DEFENSIVE,
 }
+
+
+def profile_for_ship(ship: Ship) -> PilotProfile:
+    pool = VARIANT_ARCHETYPE_POOL.get(ship.variant, (PilotArchetype.HUNTER,))
+    archetype = pool[ship.ship_id % len(pool)]
+    return ARCHETYPE_PROFILES[archetype]
 
 VARIANT_TIER = {
     ShipVariant.LIGHT: 0,
@@ -100,6 +205,7 @@ class AIDecisionContext:
     """Snapshot of AI reasoning for one tick — used by telemetry."""
 
     mode: str = "wander"
+    archetype: str | None = None
     target_id: int | None = None
     target_dist: float = 0.0
     caution: float = 0.0
@@ -121,8 +227,17 @@ class AIDecisionContext:
 
 
 class AIController:
-    def __init__(self, personality: Personality | None = None) -> None:
-        self.personality = personality or random.choice(list(Personality))
+    def __init__(
+        self,
+        personality: Personality | None = None,
+        profile: PilotProfile | None = None,
+    ) -> None:
+        self.profile = profile or NEUTRAL_PROFILE
+        self.personality = (
+            personality
+            or ARCHETYPE_TO_PERSONALITY.get(self.profile.archetype)
+            or random.choice(list(Personality))
+        )
         self.wander_timer = 0.0
         self.stuck_timer = 0.0
         self.flank_sign = random.choice([-1.0, 1.0])
@@ -147,7 +262,9 @@ class AIController:
 
     @classmethod
     def for_ship(cls, ship: Ship) -> AIController:
-        ctrl = cls(PERSONALITY_FOR_VARIANT.get(ship.variant))
+        profile = profile_for_ship(ship)
+        personality = ARCHETYPE_TO_PERSONALITY[profile.archetype]
+        ctrl = cls(personality, profile=profile)
         ctrl.break_orbit_sign = 1.0 if ship.ship_id % 2 == 0 else -1.0
         return ctrl
 
@@ -1089,11 +1206,19 @@ class AIController:
         misaligned_shot = shot_bearing > config.AI_SHOT_ALIGN_BEARING
         closing = self._radial_speed(ship, rel_to_target)
         caution = self._retreat_urgency(ship, target, dist, rel_to_target)
+        prof = self.profile
+        caution = min(
+            1.0,
+            caution * (1.35 - 0.35 * prof.risk_tolerance),
+        )
+        six_close_dist = config.AI_SIX_EVADE_CLOSE_DIST * (
+            0.85 + 0.15 * prof.six_evade
+        )
         if being_tailed and rear_dist < config.AI_SIX_EVADE_DIST:
             proximity = 1.0 - min(1.0, rear_dist / config.AI_SIX_EVADE_DIST)
             caution = min(
                 1.0,
-                caution + config.AI_SIX_EVADE_CAUTION * proximity,
+                caution + config.AI_SIX_EVADE_CAUTION * proximity * prof.six_evade,
             )
         has_los = not self._path_blocked(
             ship.position, target.position, obstacles, clearance=12.0
@@ -1125,15 +1250,17 @@ class AIController:
                 and hurt
                 and pu_score >= config.AI_POWERUP_EASY_REACH_SCORE
             )
+            seek_score = config.AI_POWERUP_SEEK_SCORE / prof.powerup_greed
+            easy_score = config.AI_POWERUP_EASY_REACH_SCORE / prof.powerup_greed
             easy_reach = (
                 pu_dist < config.AI_POWERUP_EASY_REACH_DIST
-                and pu_score >= config.AI_POWERUP_EASY_REACH_SCORE
+                and pu_score >= easy_score
                 and not self._path_blocked(
                     ship.position, pu.position, obstacles, clearance=10
                 )
             )
             commit_pickup = (
-                pu_score >= config.AI_POWERUP_SEEK_SCORE
+                pu_score >= seek_score
                 or easy_reach
                 or shield_grab
             )
@@ -1148,16 +1275,24 @@ class AIController:
             elif pu_score >= 0.28 and not panicking:
                 pickup_bias = min(0.48, pu_score - 0.08)
 
+        tail_dist_min = config.AI_TAIL_MAINTAIN_DIST_MIN / prof.tail_hold
+        tail_dist_max = config.AI_TAIL_MAINTAIN_DIST_MAX * (
+            0.92 + 0.08 * prof.tail_hold
+        )
+        tail_hold_bearing = config.AI_TAIL_HOLD_BEARING * (
+            1.0 + 0.25 * (prof.tail_hold - 1.0)
+        )
+        tail_hold_engage = config.AI_TAIL_HOLD_ENGAGE / prof.tail_hold
         tail_gunner = (
             behind_target
             and not seeking_powerup
             and not shield_ramming
-            and config.AI_TAIL_MAINTAIN_DIST_MIN < dist < config.AI_TAIL_MAINTAIN_DIST_MAX
+            and tail_dist_min < dist < tail_dist_max
             and (
                 misaligned_shot
                 or ship.health < ship.max_health * 0.52
-                or shot_bearing < config.AI_TAIL_HOLD_BEARING
-                or engage_quality >= config.AI_TAIL_HOLD_ENGAGE
+                or shot_bearing < tail_hold_bearing
+                or engage_quality >= tail_hold_engage
             )
             and not (
                 ship.health < ship.max_health * 0.28
@@ -1167,7 +1302,7 @@ class AIController:
         six_evade = (
             being_tailed
             and rear_threat is not None
-            and rear_dist < config.AI_SIX_EVADE_CLOSE_DIST
+            and rear_dist < six_close_dist
             and not tail_gunner
             and not shield_ramming
             and not seeking_powerup
@@ -1210,9 +1345,11 @@ class AIController:
                     self.reverse_gun_cooldown = config.AI_REVERSE_GUN_COOLDOWN
         elif reverse_eligible:
             self.reverse_gun_eligible_timer += dt
+            reverse_eligible_after = (
+                config.AI_REVERSE_GUN_ELIGIBLE_AFTER / prof.reverse_gun
+            )
             if (
-                self.reverse_gun_eligible_timer
-                >= config.AI_REVERSE_GUN_ELIGIBLE_AFTER
+                self.reverse_gun_eligible_timer >= reverse_eligible_after
                 and self.reverse_gun_cooldown <= 0
             ):
                 reverse_gun = True
@@ -1225,8 +1362,9 @@ class AIController:
 
         if reverse_gun:
             panicking = False
+        kite_caution_min = 0.28 / max(0.55, prof.kite_retreat)
         kiting = (
-            (caution >= 0.28 or (panic_pull and dist >= 210))
+            (caution >= kite_caution_min or (panic_pull and dist >= 210))
             and not panicking
             and not shield_ramming
             and not tail_gunner
@@ -1265,7 +1403,10 @@ class AIController:
                 self.heavy_duel_stale_timer = max(
                     0.0, self.heavy_duel_stale_timer - dt * 0.6
                 )
-            if self.heavy_duel_stale_timer >= config.AI_HEAVY_DUEL_COMMIT_AFTER:
+            heavy_commit_after = (
+                config.AI_HEAVY_DUEL_COMMIT_AFTER / prof.heavy_commit
+            )
+            if self.heavy_duel_stale_timer >= heavy_commit_after:
                 self.heavy_duel_commit_timer = config.AI_HEAVY_DUEL_COMMIT_DURATION
                 self.heavy_duel_stale_timer = 0.0
         else:
@@ -1353,6 +1494,7 @@ class AIController:
             ship, target, others, dt, obs, pickups, arena_rect
         )
         self.last_situation = sit
+        prof = self.profile
         rel_to_target = sit.rel_to_target
         dist = sit.dist
         opponents = sit.opponents
@@ -1686,13 +1828,16 @@ class AIController:
                         thrust = 0.62
             elif self.personality == Personality.DEFENSIVE:
                 if ship.health < ship.max_health * 0.4 and not tail_gunner:
-                    thrust = -0.6
+                    retreat = -0.6 * (1.45 - 0.45 * prof.risk_tolerance)
+                    thrust = max(-0.92, retreat)
                     strafe = 1.0 if random.random() > 0.5 else -1.0
                 else:
                     thrust = 0.7 if blocked else 0.5
             else:
                 thrust = 0.85
                 strafe = 1.0 if angle_diff > 0 else -1.0
+            thrust = max(-0.95, min(1.0, thrust * prof.chase_push))
+            strafe *= prof.flank_strafe
             if not tail_gunner and not shield_ramming:
                 thrust = self._blend_range_thrust(ship, dist, thrust)
             if solo_dogfight and not breaking_orbit:
@@ -1868,6 +2013,7 @@ class AIController:
             mode = "fight"
         self.last_context = AIDecisionContext(
             mode=mode,
+            archetype=self.profile.archetype.value,
             target_id=target.ship_id,
             target_dist=dist,
             caution=caution,
