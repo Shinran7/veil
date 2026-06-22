@@ -58,6 +58,15 @@ def test_next_track_index_round_robins() -> None:
     assert _next_track_index(2, 0) == 0
 
 
+def test_music_picks_random_start_index(monkeypatch) -> None:
+    mm = MusicManager()
+    mm._tracks = [Path("a.mp3"), Path("b.mp3"), Path("c.mp3")]
+    mm._track_index = 0
+    monkeypatch.setattr("audio.random.randrange", lambda n: 2)
+    mm._pick_random_start_index()
+    assert mm._track_index == 2
+
+
 def test_fade_starts_before_track_end() -> None:
     assert _fade_should_start(177.0, 180.0, 3.0) is True
     assert _fade_should_start(176.0, 180.0, 3.0) is False

@@ -5,6 +5,7 @@ from __future__ import annotations
 import array
 import math
 import os
+import random
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -231,6 +232,7 @@ class MusicManager:
         self._active = True
         self._paused = False
         if self._phase == "idle":
+            self._pick_random_start_index()
             self._begin_track()
 
     def stop(self) -> None:
@@ -258,6 +260,7 @@ class MusicManager:
         self._active = True
         self._paused = False
         if self._phase == "idle":
+            self._pick_random_start_index()
             self._begin_track()
             return
         if self._channel:
@@ -269,6 +272,10 @@ class MusicManager:
 
     def has_tracks(self) -> bool:
         return bool(self._tracks)
+
+    def _pick_random_start_index(self) -> None:
+        if self._tracks:
+            self._track_index = random.randrange(len(self._tracks))
 
     def _begin_track(self) -> None:
         if not self._tracks or self._channel is None:
