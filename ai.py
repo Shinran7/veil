@@ -53,6 +53,49 @@ class TargetMotionTrack:
 
 
 @dataclass
+class CombatSituation:
+    """Per-tick battlefield facts — perception only, before aim/thrust/fire."""
+
+    ship: Ship
+    target: Ship
+    opponents: list[Ship]
+    obstacles: list
+    powerups: list
+    arena_rect: tuple[float, float, float, float] | None
+    rel_to_target: Vec2
+    dist: float
+    closing: float
+    has_los: bool
+    engage_quality: float
+    behind_target: bool
+    shot_bearing: float
+    misaligned_shot: bool
+    target_bearing: float
+    rear_threat: Ship | None
+    being_tailed: bool
+    rear_dist: float
+    caution: float
+    shield_ramming: bool
+    panic_pull: bool
+    panicking: bool
+    panic_snap: bool
+    pickup: tuple | None
+    seeking_powerup: bool
+    pickup_bias: float
+    pickup_field_risk: float
+    tail_gunner: bool
+    six_evade: bool
+    reverse_gun: bool
+    reverse_eligible: bool
+    kiting: bool
+    snap_shot: bool
+    reengage: bool
+    heavy_duel: bool
+    solo_dogfight: bool
+    center_bias_scale: float
+
+
+@dataclass
 class AIDecisionContext:
     """Snapshot of AI reasoning for one tick — used by telemetry."""
 
@@ -62,6 +105,9 @@ class AIDecisionContext:
     caution: float = 0.0
     behind_target: bool = False
     tail_gunner: bool = False
+    being_tailed: bool = False
+    six_evade: bool = False
+    reverse_gun: bool = False
     panicking: bool = False
     kiting: bool = False
     shield_ramming: bool = False
@@ -92,8 +138,12 @@ class AIController:
         self.locked_target_id: int | None = None
         self.heavy_duel_stale_timer = 0.0
         self.heavy_duel_commit_timer = 0.0
+        self.reverse_gun_eligible_timer = 0.0
+        self.reverse_gun_commit_timer = 0.0
+        self.reverse_gun_cooldown = 0.0
         self._target_tracks: dict[int, TargetMotionTrack] = {}
         self.last_context = AIDecisionContext()
+        self.last_situation: CombatSituation | None = None
 
     @classmethod
     def for_ship(cls, ship: Ship) -> AIController:
@@ -517,6 +567,9 @@ class AIController:
         if not self._path_blocked(ship.position, other.position, obstacles, clearance=12.0):
             score += 0.08
 
+        if self._is_behind_target(ship, other, rel):
+            score += config.AI_TAIL_TARGET_BONUS
+
         return max(0.0, score)
 
     def _select_combat_target(
@@ -550,7 +603,11 @@ class AIController:
                 locked_score = self._score_combat_target(
                     ship, locked, arena_rect, obstacles
                 )
-                if locked_score >= best_score - config.AI_TARGET_SWITCH_MARGIN:
+                margin = config.AI_TARGET_SWITCH_MARGIN
+                locked_rel = self._target_delta(ship, locked, arena_rect)
+                if self._is_behind_target(ship, locked, locked_rel):
+                    margin += config.AI_TAIL_TARGET_LOCK_MARGIN
+                if locked_score >= best_score - margin:
                     return locked
 
         self.locked_target_id = best.ship_id
@@ -619,6 +676,81 @@ class AIController:
         to_ship = math.atan2(-rel[1], -rel[0])
         rear_gap = abs(self._angle_diff(target.angle, to_ship))
         return rear_gap > 2.2
+
+    def _nearest_rear_threat(
+        self,
+        ship: Ship,
+        others: list[Ship],
+        arena_rect: tuple[float, float, float, float] | None,
+    ) -> Ship | None:
+        """Nearest opponent sitting on this ship's six."""
+        best: Ship | None = None
+        best_dist = float("inf")
+        for other in self._living_opponents(ship, others):
+            rel = self._target_delta(other, ship, arena_rect)
+            if not self._is_behind_target(other, ship, rel):
+                continue
+            dist = vec_len(rel)
+            if dist < best_dist:
+                best_dist = dist
+                best = other
+        return best
+
+    def _reverse_gun_eligible(
+        self,
+        ship: Ship,
+        target: Ship,
+        dist: float,
+        rel: Vec2,
+        closing: float,
+        behind_target: bool,
+        has_los: bool,
+    ) -> bool:
+        """Head-on, in range, closing — worth considering astern gun run."""
+        if behind_target or not has_los:
+            return False
+        if dist < config.AI_REVERSE_GUN_MIN_DIST or dist > config.AI_REVERSE_GUN_MAX_DIST:
+            return False
+        to_target = math.atan2(rel[1], rel[0])
+        if abs(self._angle_diff(ship.angle, to_target)) > config.AI_REVERSE_GUN_BEARING:
+            return False
+        ideal = self._ideal_weapon_range(ship)
+        inner = config.AI_RANGE_INNER_TOLERANCE
+        too_close = dist < ideal - inner * 0.35
+        if closing >= config.AI_REVERSE_GUN_CLOSING:
+            return True
+        return too_close and closing > 12.0
+
+    def _reverse_gun_thrust(self, ship: Ship, commit_remaining: float) -> float:
+        """Ramp into reverse instead of slamming from cruise to full astern."""
+        elapsed = config.AI_REVERSE_GUN_COMMIT - commit_remaining
+        ramp = min(1.0, max(0.0, elapsed / config.AI_REVERSE_GUN_RAMP_TIME))
+        thrust = config.AI_REVERSE_GUN_THRUST_MIN + (
+            config.AI_REVERSE_GUN_THRUST_MAX - config.AI_REVERSE_GUN_THRUST_MIN
+        ) * ramp
+        speed = vec_len(ship.velocity)
+        if speed > 210:
+            thrust = min(thrust, config.AI_REVERSE_GUN_THRUST_MIN)
+        return thrust
+
+    def _break_six_aim(
+        self,
+        ship: Ship,
+        chaser: Ship,
+        arena_rect: tuple[float, float, float, float] | None,
+    ) -> Vec2:
+        """Jink off the chaser's line — face them if blind, otherwise hard break."""
+        rel = self._target_delta(ship, chaser, arena_rect)
+        dist = max(vec_len(rel), 1.0)
+        to_chaser = math.atan2(rel[1], rel[0])
+        if abs(self._angle_diff(ship.angle, to_chaser)) > 1.05:
+            return chaser.position
+        perp = (-rel[1] / dist * self.break_orbit_sign, rel[0] / dist * self.break_orbit_sign)
+        offset = 150.0
+        return (
+            ship.position[0] + perp[0] * offset,
+            ship.position[1] + perp[1] * offset,
+        )
 
     def _path_blocked(
         self, start: Vec2, end: Vec2, obstacles: list, clearance: float = 8.0
@@ -778,6 +910,8 @@ class AIController:
             urgency *= 0.75
         if self._is_behind_target(ship, target, rel) and health_ratio < 0.52:
             urgency *= 0.18
+        elif self._is_behind_target(ship, target, rel):
+            urgency *= 0.42
         return urgency
 
     def _ideal_weapon_range(self, ship: Ship) -> float:
@@ -926,39 +1060,46 @@ class AIController:
             ship.position[1] + perp[1] * offset * sign,
         )
 
-    def update(
+    def _assess_combat_situation(
         self,
         ship: Ship,
+        target: Ship,
         others: list[Ship],
         dt: float,
-        obstacles: list | None = None,
-        powerups: list | None = None,
-        arena_rect: tuple[float, float, float, float] | None = None,
-    ) -> tuple[float, float, bool]:
-        """Return rotate_dir (-1/0/1), thrust_dir, should_fire."""
-        obs = obstacles or []
-        pickups = powerups or []
-        target = self._select_combat_target(ship, others, obs, arena_rect)
-        if target is None:
-            self.wander_timer -= dt
-            if self.wander_timer <= 0:
-                self.wander_timer = random.uniform(0.5, 1.5)
-            rot = float(random.choice([-1, 0, 1]))
-            self.last_context = AIDecisionContext(mode="wander", rotate=rot)
-            return (rot, 0.0, False)
-
+        obstacles: list,
+        powerups: list,
+        arena_rect: tuple[float, float, float, float] | None,
+    ) -> CombatSituation:
+        """Gather battlefield facts and mode eligibility for this tick."""
         self._update_target_track(target, dt)
         rel_to_target = self._target_delta(ship, target, arena_rect)
         dist = vec_len(rel_to_target)
         opponents = self._living_opponents(ship, others)
+        rear_threat = self._nearest_rear_threat(ship, opponents, arena_rect)
+        being_tailed = rear_threat is not None
+        rear_dist = float("inf")
+        if rear_threat is not None:
+            rear_rel = self._target_delta(rear_threat, ship, arena_rect)
+            rear_dist = vec_len(rear_rel)
         engage_quality = self._engagement_quality(
-            ship, target, dist, rel_to_target, obs, arena_rect
+            ship, target, dist, rel_to_target, obstacles, arena_rect
         )
         behind_target = self._is_behind_target(ship, target, rel_to_target)
         shot_bearing = self._shot_alignment_bearing(ship, target, rel_to_target)
         misaligned_shot = shot_bearing > config.AI_SHOT_ALIGN_BEARING
         closing = self._radial_speed(ship, rel_to_target)
         caution = self._retreat_urgency(ship, target, dist, rel_to_target)
+        if being_tailed and rear_dist < config.AI_SIX_EVADE_DIST:
+            proximity = 1.0 - min(1.0, rear_dist / config.AI_SIX_EVADE_DIST)
+            caution = min(
+                1.0,
+                caution + config.AI_SIX_EVADE_CAUTION * proximity,
+            )
+        has_los = not self._path_blocked(
+            ship.position, target.position, obstacles, clearance=12.0
+        )
+        to_target = math.atan2(rel_to_target[1], rel_to_target[0])
+        target_bearing = abs(self._angle_diff(ship.angle, to_target))
         shield_ramming = (
             ship.shield_timer > 0 and dist < self._shield_ram_range(ship)
         )
@@ -967,7 +1108,7 @@ class AIController:
         panicking = panic_pull and dist < 210
 
         pickup = self._best_powerup_target(
-            ship, pickups, dist, caution, obs, others, arena_rect
+            ship, powerups, dist, caution, obstacles, others, arena_rect
         )
         seeking_powerup = False
         pickup_bias = 0.0
@@ -987,7 +1128,9 @@ class AIController:
             easy_reach = (
                 pu_dist < config.AI_POWERUP_EASY_REACH_DIST
                 and pu_score >= config.AI_POWERUP_EASY_REACH_SCORE
-                and not self._path_blocked(ship.position, pu.position, obs, clearance=10)
+                and not self._path_blocked(
+                    ship.position, pu.position, obstacles, clearance=10
+                )
             )
             commit_pickup = (
                 pu_score >= config.AI_POWERUP_SEEK_SCORE
@@ -1009,20 +1152,86 @@ class AIController:
             behind_target
             and not seeking_powerup
             and not shield_ramming
+            and config.AI_TAIL_MAINTAIN_DIST_MIN < dist < config.AI_TAIL_MAINTAIN_DIST_MAX
             and (
-                ship.health < ship.max_health * 0.52
-                or misaligned_shot
+                misaligned_shot
+                or ship.health < ship.max_health * 0.52
+                or shot_bearing < config.AI_TAIL_HOLD_BEARING
+                or engage_quality >= config.AI_TAIL_HOLD_ENGAGE
             )
+            and not (
+                ship.health < ship.max_health * 0.28
+                and VARIANT_TIER[target.variant] > VARIANT_TIER[ship.variant]
+            )
+        )
+        six_evade = (
+            being_tailed
+            and rear_threat is not None
+            and rear_dist < config.AI_SIX_EVADE_CLOSE_DIST
+            and not tail_gunner
+            and not shield_ramming
+            and not seeking_powerup
         )
         if tail_gunner:
             panicking = False
             panic_pull = False
+        if six_evade:
+            panicking = False
+
+        reverse_eligible = (
+            self._reverse_gun_eligible(
+                ship,
+                target,
+                dist,
+                rel_to_target,
+                closing,
+                behind_target,
+                has_los,
+            )
+            and not shield_ramming
+            and not seeking_powerup
+            and not tail_gunner
+            and not six_evade
+        )
+        reverse_gun = False
+        if self.reverse_gun_cooldown > 0:
+            self.reverse_gun_cooldown = max(0.0, self.reverse_gun_cooldown - dt)
+        if self.reverse_gun_commit_timer > 0:
+            lost_aim = target_bearing > 1.05
+            if dist > config.AI_REVERSE_GUN_ABORT_DIST or lost_aim or not has_los:
+                self.reverse_gun_commit_timer = 0.0
+                self.reverse_gun_cooldown = config.AI_REVERSE_GUN_COOLDOWN * 0.5
+            else:
+                reverse_gun = True
+                self.reverse_gun_commit_timer = max(
+                    0.0, self.reverse_gun_commit_timer - dt
+                )
+                if self.reverse_gun_commit_timer <= 0:
+                    self.reverse_gun_cooldown = config.AI_REVERSE_GUN_COOLDOWN
+        elif reverse_eligible:
+            self.reverse_gun_eligible_timer += dt
+            if (
+                self.reverse_gun_eligible_timer
+                >= config.AI_REVERSE_GUN_ELIGIBLE_AFTER
+                and self.reverse_gun_cooldown <= 0
+            ):
+                reverse_gun = True
+                self.reverse_gun_commit_timer = config.AI_REVERSE_GUN_COMMIT
+                self.reverse_gun_eligible_timer = 0.0
+        else:
+            self.reverse_gun_eligible_timer = max(
+                0.0, self.reverse_gun_eligible_timer - dt * 0.6
+            )
+
+        if reverse_gun:
+            panicking = False
         kiting = (
             (caution >= 0.28 or (panic_pull and dist >= 210))
             and not panicking
             and not shield_ramming
             and not tail_gunner
-            and not (behind_target and misaligned_shot)
+            and not six_evade
+            and not reverse_gun
             and not seeking_powerup
         )
 
@@ -1046,6 +1255,8 @@ class AIController:
             and not shield_ramming
             and not seeking_powerup
             and not tail_gunner
+            and not six_evade
+            and not reverse_gun
         )
         if heavy_duel:
             if abs(dist - self.last_dist) < 14.0 and abs(closing) < 35.0:
@@ -1069,11 +1280,111 @@ class AIController:
             and not shield_ramming
             and not seeking_powerup
             and not tail_gunner
+            and not six_evade
+            and not reverse_gun
             and not heavy_duel
         )
         center_bias_scale = (
             config.AI_HEAVY_DUEL_CENTER_BIAS if heavy_duel else 1.0
         )
+        return CombatSituation(
+            ship=ship,
+            target=target,
+            opponents=opponents,
+            obstacles=obstacles,
+            powerups=powerups,
+            arena_rect=arena_rect,
+            rel_to_target=rel_to_target,
+            dist=dist,
+            closing=closing,
+            has_los=has_los,
+            engage_quality=engage_quality,
+            behind_target=behind_target,
+            shot_bearing=shot_bearing,
+            misaligned_shot=misaligned_shot,
+            target_bearing=target_bearing,
+            rear_threat=rear_threat,
+            being_tailed=being_tailed,
+            rear_dist=rear_dist,
+            caution=caution,
+            shield_ramming=shield_ramming,
+            panic_pull=panic_pull,
+            panicking=panicking,
+            panic_snap=panic_snap,
+            pickup=pickup,
+            seeking_powerup=seeking_powerup,
+            pickup_bias=pickup_bias,
+            pickup_field_risk=pickup_field_risk,
+            tail_gunner=tail_gunner,
+            six_evade=six_evade,
+            reverse_gun=reverse_gun,
+            reverse_eligible=reverse_eligible,
+            kiting=kiting,
+            snap_shot=snap_shot,
+            reengage=reengage,
+            heavy_duel=heavy_duel,
+            solo_dogfight=solo_dogfight,
+            center_bias_scale=center_bias_scale,
+        )
+
+    def update(
+        self,
+        ship: Ship,
+        others: list[Ship],
+        dt: float,
+        obstacles: list | None = None,
+        powerups: list | None = None,
+        arena_rect: tuple[float, float, float, float] | None = None,
+    ) -> tuple[float, float, bool]:
+        """Return rotate_dir (-1/0/1), thrust_dir, should_fire."""
+        obs = obstacles or []
+        pickups = powerups or []
+        target = self._select_combat_target(ship, others, obs, arena_rect)
+        if target is None:
+            self.wander_timer -= dt
+            self.last_situation = None
+            if self.wander_timer <= 0:
+                self.wander_timer = random.uniform(0.5, 1.5)
+            rot = float(random.choice([-1, 0, 1]))
+            self.last_context = AIDecisionContext(mode="wander", rotate=rot)
+            return (rot, 0.0, False)
+
+        sit = self._assess_combat_situation(
+            ship, target, others, dt, obs, pickups, arena_rect
+        )
+        self.last_situation = sit
+        rel_to_target = sit.rel_to_target
+        dist = sit.dist
+        opponents = sit.opponents
+        rear_threat = sit.rear_threat
+        being_tailed = sit.being_tailed
+        rear_dist = sit.rear_dist
+        engage_quality = sit.engage_quality
+        behind_target = sit.behind_target
+        shot_bearing = sit.shot_bearing
+        misaligned_shot = sit.misaligned_shot
+        closing = sit.closing
+        caution = sit.caution
+        has_los = sit.has_los
+        shield_ramming = sit.shield_ramming
+        panic_pull = sit.panic_pull
+        panicking = sit.panicking
+        panic_snap = sit.panic_snap
+        pickup = sit.pickup
+        seeking_powerup = sit.seeking_powerup
+        pickup_bias = sit.pickup_bias
+        pickup_field_risk = sit.pickup_field_risk
+        tail_gunner = sit.tail_gunner
+        six_evade = sit.six_evade
+        reverse_gun = sit.reverse_gun
+        kiting = sit.kiting
+        snap_shot = sit.snap_shot
+        reengage = sit.reengage
+        heavy_duel = sit.heavy_duel
+        solo_dogfight = sit.solo_dogfight
+        center_bias_scale = sit.center_bias_scale
+        target_bearing = sit.target_bearing
+        to_target = math.atan2(rel_to_target[1], rel_to_target[0])
 
         if shield_ramming:
             aim_pos = (
@@ -1081,6 +1392,10 @@ class AIController:
                 if dist < 130
                 else self.lead_target(ship, target, arena_rect)
             )
+        elif six_evade and rear_threat is not None:
+            aim_pos = self._break_six_aim(ship, rear_threat, arena_rect)
+        elif reverse_gun:
+            aim_pos = self.lead_target(ship, target, arena_rect)
         elif tail_gunner:
             aim_pos = self._aim_when_behind(
                 ship, target, rel_to_target, arena_rect, misaligned_shot
@@ -1111,7 +1426,14 @@ class AIController:
                 aim_pos[1] * (1.0 - pickup_bias) + pu_pos[1] * pickup_bias,
             )
         blocked = self._path_blocked(ship.position, aim_pos, obs)
-        if blocked and not panicking and not kiting and not shield_ramming and not seeking_powerup:
+        if (
+            blocked
+            and not panicking
+            and not kiting
+            and not reverse_gun
+            and not shield_ramming
+            and not seeking_powerup
+        ):
             aim_pos = self._flank_point(ship, target, obs)
 
         avoid = self._avoidance_vector(ship, obs)
@@ -1140,8 +1462,6 @@ class AIController:
         if ship.variant == ShipVariant.LIGHT:
             fire_cone = 0.82
             fire_range = 820.0
-        has_los = not self._path_blocked(ship.position, target.position, obs, clearance=12.0)
-
         stale_tail = self._is_stale_tail_chase(ship, target, angle_diff, dist)
         stale_lead = self._is_stale_lead_orbit(ship, target, dist)
         stale_mutual = self._is_mutual_orbit(ship, target, dist, abs(dist - self.last_dist))
@@ -1166,15 +1486,15 @@ class AIController:
         break_chase = self.chase_stale_timer > config.ORBIT_BREAK_CHASE_TIMER
         break_lead = self.lead_stale_timer > config.ORBIT_BREAK_LEAD_TIMER
         break_mutual = self.orbit_stale_timer > config.ORBIT_BREAK_MUTUAL_TIMER
-        to_target = math.atan2(rel_to_target[1], rel_to_target[0])
-        target_bearing = abs(self._angle_diff(ship.angle, to_target))
         if (
             (break_chase or break_lead or break_mutual)
             and not panicking
             and not shield_ramming
             and not seeking_powerup
             and not tail_gunner
-            and not (behind_target and misaligned_shot)
+            and not six_evade
+            and not reverse_gun
+            and not behind_target
         ):
             breaking_orbit = True
             self.orbit_break_timer += dt
@@ -1265,12 +1585,28 @@ class AIController:
         ):
             thrust = -0.52
             strafe = self.flank_sign * 0.95
+        elif six_evade:
+            thrust = config.AI_SIX_BREAK_THRUST
+            strafe = self.break_orbit_sign * config.AI_SIX_BREAK_STRAFE
+        elif reverse_gun:
+            thrust = self._reverse_gun_thrust(ship, self.reverse_gun_commit_timer)
+            strafe = self.flank_sign * 0.08
         elif tail_gunner:
-            thrust = 0.42 if dist > 180 else 0.22
-            if misaligned_shot and abs(angle_diff) > 0.35:
-                strafe = rotate_dir * 0.28
+            ideal = self._ideal_weapon_range(ship)
+            inner = config.AI_RANGE_INNER_TOLERANCE
+            outer = config.AI_RANGE_OUTER_TOLERANCE
+            if dist > ideal + outer:
+                thrust = 0.58 if misaligned_shot else 0.44
+            elif dist < ideal - inner * 0.65:
+                thrust = -0.1 if closing > 35 else 0.12
             else:
-                strafe = self.flank_sign * 0.2
+                thrust = 0.38 if misaligned_shot else 0.3
+            if vec_len(target.velocity) > 45 and not misaligned_shot:
+                thrust = max(thrust, 0.28)
+            if misaligned_shot and abs(angle_diff) > 0.35:
+                strafe = rotate_dir * 0.22
+            else:
+                strafe = self.flank_sign * 0.1
         elif reengage or (kiting and dist > 320):
             thrust = 0.7 if dist > 400 else 0.5
             strafe = self.flank_sign * 0.6
@@ -1378,10 +1714,28 @@ class AIController:
 
         should_fire = has_los and facing_target and dist < fire_range
         if tail_gunner:
+            cone = 0.82 if misaligned_shot else 0.68
             should_fire = (
                 has_los
                 and dist < fire_range
-                and abs(self._angle_diff(ship.angle, to_target)) < 0.78
+                and abs(self._angle_diff(ship.angle, to_target)) < cone
+            )
+        elif six_evade and rear_threat is not None:
+            rear_rel = self._target_delta(ship, rear_threat, arena_rect)
+            to_rear = math.atan2(rear_rel[1], rear_rel[0])
+            rear_los = not self._path_blocked(
+                ship.position, rear_threat.position, obs, clearance=12.0
+            )
+            should_fire = (
+                rear_los
+                and rear_dist < fire_range
+                and abs(self._angle_diff(ship.angle, to_rear)) < 0.85
+            )
+        elif reverse_gun:
+            should_fire = (
+                has_los
+                and dist < fire_range
+                and target_bearing < 0.62
             )
         elif shield_ramming:
             should_fire = (
@@ -1451,6 +1805,8 @@ class AIController:
             self.stuck_timer > 0.8
             and not shield_ramming
             and not tail_gunner
+            and not six_evade
+            and not reverse_gun
             and not heavy_duel
         ):
             thrust = -0.8
@@ -1469,12 +1825,21 @@ class AIController:
 
         hurt_ship = ship.health < ship.max_health * config.AI_INJURY_HEALTH_RATIO
         if not shield_ramming:
-            ram_brake = self._ram_avoid_thrust(ship, others)
-            if ram_brake is not None:
-                thrust = ram_brake
-                strafe *= 0.4
-            thrust, strafe = self._injury_speed_control(ship, thrust, strafe, dist)
-        if thrust < 0 and (dist > 220 or -closing > 50) and not hurt_ship:
+            if not reverse_gun:
+                ram_brake = self._ram_avoid_thrust(ship, others)
+                if ram_brake is not None:
+                    thrust = ram_brake
+                    strafe *= 0.4
+            if not reverse_gun:
+                thrust, strafe = self._injury_speed_control(
+                    ship, thrust, strafe, dist
+                )
+        if (
+            thrust < 0
+            and (dist > 220 or -closing > 50)
+            and not hurt_ship
+            and not reverse_gun
+        ):
             thrust = 0.2 if dist > 300 else 0.0
 
         if strafe != 0:
@@ -1483,6 +1848,10 @@ class AIController:
         will_fire = should_fire and ship.can_fire()
         if tail_gunner:
             mode = "tail_gunner"
+        elif six_evade:
+            mode = "six_evade"
+        elif reverse_gun:
+            mode = "reverse_gun"
         elif shield_ramming:
             mode = "shield_ram"
         elif seeking_powerup:
@@ -1504,6 +1873,9 @@ class AIController:
             caution=caution,
             behind_target=behind_target,
             tail_gunner=tail_gunner,
+            being_tailed=being_tailed,
+            six_evade=six_evade,
+            reverse_gun=reverse_gun,
             panicking=panicking,
             kiting=kiting,
             shield_ramming=shield_ramming,
